@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "level": "balanced",
+  "allow_background_research": true,
+  "allow_multistep_tasks": true,
+  "allow_memory_updates": true,
+  "progress_updates": true,
+  "protected_actions_require_confirmation": true,
+  "allow_protected_actions": false,
+  "research_default_depth": "standard",
+  "max_background_tasks": 3
+}

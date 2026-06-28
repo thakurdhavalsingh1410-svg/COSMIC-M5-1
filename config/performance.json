@@ -1,0 +1,11 @@
+{
+  "mode": "performance",
+  "web_poll_ms": 3000,
+  "local_background_ms": 120,
+  "local_orb_ms": 50,
+  "local_metrics_ms": 5000,
+  "stars": 28,
+  "particles": 6,
+  "reduced_glow": true,
+  "version": 1
+}

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "engine": "windows",
+  "gemini_voice": "Charon",
+  "windows_voice": "",
+  "windows_rate": 0,
+  "windows_volume": 90,
+  "windows_fallback": true,
+  "announce_system_messages": false
+}
