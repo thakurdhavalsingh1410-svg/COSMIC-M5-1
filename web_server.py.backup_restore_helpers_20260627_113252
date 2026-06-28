@@ -1,0 +1,1473 @@
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import socket
+import subprocess
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Callable
+from urllib.parse import parse_qs, urlparse
+
+
+WEB_HOST = os.getenv("COSMIC_WEB_HOST", "127.0.0.1")
+WEB_PORT = int(os.getenv("COSMIC_WEB_PORT", "8765"))
+PROJECT_ROOT = Path(__file__).resolve().parent
+DIST_DIR = PROJECT_ROOT / "dist"
+USE_DIST_WEB = os.getenv("COSMIC_WEB_USE_DIST", "0").lower() in {"1", "true", "yes"}
+
+# COSMIC_FIX_NEVER_STALE_CACHE
+# Unique per-server-startup token. Used to:
+# 1) version the service worker cache so old caches self-destruct on activate
+# 2) bust the /sw.js registration with ?v= so the browser always installs the new SW
+# 3) inline a build marker into the HTML so the page itself never returns a stale shell
+_BUILD_TOKEN = str(int(time.time()))
+BUILD_TOKEN = os.getenv("COSMIC_BUILD_TOKEN") or _BUILD_TOKEN
+
+PHONE_SECURITY_PATH = PROJECT_ROOT / "config" / "phone_access.json"
+RESEARCH_TASKS_PATH = PROJECT_ROOT / "config" / "research_tasks.json"
+
+# COSMIC_TOP_UTILITY_BUTTONS_VOICE_PANEL
+VOICE_CONFIG_PATH = PROJECT_ROOT / "config" / "voice.json"
+VOICE_DEFAULTS = {
+    "version": 1,
+    "engine": "windows",
+    "gemini_voice": "Charon",
+    "windows_voice": "",
+    "windows_rate": 0,
+    "windows_volume": 90,
+    "windows_fallback": True,
+    "announce_system_messages": False,
+}
+
+
+def _clamp_int(value: object, low: int, high: int, fallback: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = fallback
+    return max(low, min(high, number))
+
+
+def _clean_voice_config(data: dict | None = None) -> dict:
+    config = dict(VOICE_DEFAULTS)
+    if isinstance(data, dict):
+        config.update(data)
+    engine = str(config.get("engine", "windows")).lower().strip()
+    config["engine"] = engine if engine in {"windows", "gemini", "hybrid"} else "windows"
+    config["gemini_voice"] = str(config.get("gemini_voice") or "Charon").strip() or "Charon"
+    config["windows_voice"] = str(config.get("windows_voice") or "").strip()
+    config["windows_rate"] = _clamp_int(config.get("windows_rate"), -10, 10, 0)
+    config["windows_volume"] = _clamp_int(config.get("windows_volume"), 0, 100, 90)
+    config["windows_fallback"] = bool(config.get("windows_fallback", True))
+    config["announce_system_messages"] = bool(config.get("announce_system_messages", False))
+    return config
+
+
+def _load_voice_config_web() -> dict:
+    try:
+        raw = json.loads(VOICE_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    return _clean_voice_config(raw if isinstance(raw, dict) else {})
+
+
+def _save_voice_config_web(updates: dict | None = None) -> dict:
+    current = _load_voice_config_web()
+    updates = updates if isinstance(updates, dict) else {}
+    aliases = {
+        "voice_name": "gemini_voice",
+        "rate": "windows_rate",
+        "volume": "windows_volume",
+    }
+    for key, value in updates.items():
+        mapped = aliases.get(str(key), str(key))
+        if mapped in VOICE_DEFAULTS:
+            current[mapped] = value
+    clean = _clean_voice_config(current)
+    VOICE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = VOICE_CONFIG_PATH.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(clean, indent=2), encoding="utf-8")
+    temp_path.replace(VOICE_CONFIG_PATH)
+    return clean
+
+
+def _list_windows_voices_web() -> list[str]:
+    try:
+        from voice.windows_voice import list_windows_voices
+
+        return [str(name) for name in (list_windows_voices() or [])]
+    except Exception:
+        return []
+
+
+def _test_voice_web(text: str = "") -> str:
+    sample = str(text or "COSMIC Mark Five voice system online.").strip()[:360]
+    try:
+        from voice.voice_manager import speak_with_windows_config
+    except Exception as exc:
+        return f"Voice test failed: {exc}"
+
+    def _worker() -> None:
+        try:
+            speak_with_windows_config(sample, wait=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, daemon=True, name="CosmicWebVoiceTest").start()
+    return "Voice test started through Windows voice."
+
+# COSMIC_EDITABLE_CALENDAR
+
+
+def _load_phone_security() -> dict:
+    try:
+        data = json.loads(PHONE_SECURITY_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _verify_phone_pin(pin: str, config: dict) -> bool:
+    if not config.get("enabled", False):
+        return True
+    salt = str(config.get("salt", ""))
+    expected = str(config.get("pin_hash", ""))
+    if not salt or not expected or not pin:
+        return False
+    actual = hashlib.sha256((salt + str(pin)).encode("utf-8")).hexdigest()
+    return actual == expected
+
+
+def _client_is_local(address: str) -> bool:
+    address = str(address or "")
+    return address in {"127.0.0.1", "::1", "localhost"} or address.startswith("127.")
+
+
+def _research_task_snapshot() -> dict:
+    try:
+        data = json.loads(RESEARCH_TASKS_PATH.read_text(encoding="utf-8"))
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+        if not isinstance(tasks, list):
+            tasks = []
+        return {"tasks": tasks[:10]}
+    except Exception:
+        return {"tasks": []}
+
+
+
+
+
+CALENDAR_EVENTS_PATH = PROJECT_ROOT / "data" / "calendar_events.json"
+CALENDAR_EXPORT_PATH = PROJECT_ROOT / "data" / "cosmic_calendar_export.ics"
+
+# COSMIC_EDITABLE_ACTIVE_GOALS
+ACTIVE_GOALS_PATH = PROJECT_ROOT / "data" / "active_goals.json"
+
+
+def _default_active_goals() -> dict:
+    return {
+        "version": 1,
+        "title": "Physics Lab Report 2",
+        "completed": 0,
+        "total": 10,
+        "objectives": [
+            "Physics Lab Reporting",
+            "Draft findings and graphs",
+            "Gantt refinement",
+        ],
+        "recents": "Physics Lab Report 2 notes and study sessions.",
+        "notes": "Recent notes can be promoted into Mark 5 memory.",
+        "updated_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
+    }
+
+
+def _goal_int(value: object, fallback: int, low: int = 0, high: int = 999) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = fallback
+    return max(low, min(high, number))
+
+
+def _goal_text(value: object, fallback: str = "", limit: int = 500) -> str:
+    text = str(value if value is not None else fallback).strip()
+    return (text or fallback)[:limit]
+
+
+def _normalize_active_goals(raw: dict | None = None) -> dict:
+    default = _default_active_goals()
+    raw = raw if isinstance(raw, dict) else {}
+    total = _goal_int(raw.get("total", default["total"]), default["total"], 1, 999)
+    completed = _goal_int(raw.get("completed", default["completed"]), default["completed"], 0, total)
+    objectives_raw = raw.get("objectives", default["objectives"])
+    if isinstance(objectives_raw, str):
+        objectives = [line.strip() for line in objectives_raw.splitlines() if line.strip()]
+    elif isinstance(objectives_raw, list):
+        objectives = [_goal_text(item, "", 140) for item in objectives_raw if str(item or "").strip()]
+    else:
+        objectives = list(default["objectives"])
+    objectives = objectives[:12] or list(default["objectives"])
+    return {
+        "version": 1,
+        "title": _goal_text(raw.get("title"), default["title"], 160),
+        "completed": completed,
+        "total": total,
+        "objectives": objectives,
+        "recents": _goal_text(raw.get("recents"), default["recents"], 900),
+        "notes": _goal_text(raw.get("notes"), default["notes"], 1400),
+        "updated_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
+    }
+
+
+def _save_active_goals(goals: dict) -> dict:
+    clean = _normalize_active_goals(goals)
+    ACTIVE_GOALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = ACTIVE_GOALS_PATH.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(clean, indent=2), encoding="utf-8")
+    temp_path.replace(ACTIVE_GOALS_PATH)
+    return clean
+
+
+def _load_active_goals() -> dict:
+    if not ACTIVE_GOALS_PATH.exists():
+        return _save_active_goals(_default_active_goals())
+    try:
+        data = json.loads(ACTIVE_GOALS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    return _normalize_active_goals(data if isinstance(data, dict) else {})
+
+
+def _active_goals_snapshot() -> dict:
+    goals = _load_active_goals()
+    return {"version": 1, "goals": goals, "storage": str(ACTIVE_GOALS_PATH)}
+
+
+
+def _today_iso() -> str:
+    return dt.date.today().isoformat()
+
+
+def _calendar_seed_events() -> list[dict]:
+    today = _today_iso()
+    return [
+        {
+            "id": "seed-physics",
+            "title": "Physics Schedule",
+            "date": today,
+            "time": "10:00",
+            "end_time": "",
+            "location": "",
+            "notes": "Imported from COSMIC schedule.",
+            "source": "cosmic",
+        },
+        {
+            "id": "seed-project",
+            "title": "Project Work",
+            "date": today,
+            "time": "13:30",
+            "end_time": "",
+            "location": "",
+            "notes": "Imported from COSMIC schedule.",
+            "source": "cosmic",
+        },
+    ]
+
+
+def _hhmm(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.match(r"^(\d{1,2}):(\d{2})", text)
+    if not match:
+        return ""
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return f"{hour:02d}:{minute:02d}"
+    return ""
+
+
+def _normalize_event(raw: dict, existing_id: str = "") -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    event_id = str(raw.get("id") or existing_id or uuid.uuid4().hex).strip()
+    event_id = re.sub(r"[^A-Za-z0-9_.:-]", "-", event_id)[:80] or uuid.uuid4().hex
+    title = str(raw.get("title") or raw.get("summary") or "Untitled event").strip()[:160]
+    date_text = str(raw.get("date") or _today_iso()).strip()[:10]
+    try:
+        date_text = dt.date.fromisoformat(date_text).isoformat()
+    except ValueError:
+        date_text = _today_iso()
+    return {
+        "id": event_id,
+        "title": title or "Untitled event",
+        "date": date_text,
+        "time": _hhmm(raw.get("time")),
+        "end_time": _hhmm(raw.get("end_time")),
+        "location": str(raw.get("location") or "").strip()[:160],
+        "notes": str(raw.get("notes") or raw.get("description") or "").strip()[:1200],
+        "source": str(raw.get("source") or "cosmic").strip()[:40] or "cosmic",
+        "updated_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
+    }
+
+
+def _sort_events(events: list[dict]) -> list[dict]:
+    return sorted(events, key=lambda item: (item.get("date", ""), item.get("time", ""), item.get("title", "")))
+
+
+def _save_calendar_events(events: list[dict]) -> None:
+    CALENDAR_EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, "events": _sort_events(events)}
+    CALENDAR_EVENTS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _load_calendar_events() -> list[dict]:
+    if not CALENDAR_EVENTS_PATH.exists():
+        events = _calendar_seed_events()
+        _save_calendar_events(events)
+        return events
+    try:
+        data = json.loads(CALENDAR_EVENTS_PATH.read_text(encoding="utf-8"))
+        events = data.get("events", []) if isinstance(data, dict) else []
+        if not isinstance(events, list):
+            events = []
+        return _sort_events([_normalize_event(event) for event in events if isinstance(event, dict)])
+    except Exception:
+        return []
+
+
+def _calendar_snapshot() -> dict:
+    events = _load_calendar_events()
+    return {
+        "version": 1,
+        "events": events,
+        "count": len(events),
+        "storage": str(CALENDAR_EVENTS_PATH),
+        "bridge": "local_json_plus_ics",
+    }
+
+
+def _ics_escape(value: object) -> str:
+    text = str(value or "")
+    return text.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
+
+
+def _ics_unescape(value: str) -> str:
+    return (
+        value.replace("\\n", "\n")
+        .replace("\\,", ",")
+        .replace("\\;", ";")
+        .replace("\\\\", "\\")
+    )
+
+
+def _ics_datetime(event: dict, key: str = "time") -> str:
+    date_part = str(event.get("date") or _today_iso()).replace("-", "")
+    time_part = _hhmm(event.get(key))
+    if not time_part:
+        return f";VALUE=DATE:{date_part}"
+    return f":{date_part}T{time_part.replace(':', '')}00"
+
+
+def _events_to_ics(events: list[dict]) -> str:
+    now = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//COSMIC//Local Calendar//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+    ]
+    for event in _sort_events(events):
+        uid = f"{event.get('id', uuid.uuid4().hex)}@cosmic.local"
+        lines.extend(
+            [
+                "BEGIN:VEVENT",
+                f"UID:{_ics_escape(uid)}",
+                f"DTSTAMP:{now}",
+                f"DTSTART{_ics_datetime(event, 'time')}",
+            ]
+        )
+        if event.get("end_time"):
+            lines.append(f"DTEND{_ics_datetime(event, 'end_time')}")
+        lines.append(f"SUMMARY:{_ics_escape(event.get('title'))}")
+        if event.get("location"):
+            lines.append(f"LOCATION:{_ics_escape(event.get('location'))}")
+        if event.get("notes"):
+            lines.append(f"DESCRIPTION:{_ics_escape(event.get('notes'))}")
+        lines.extend(["END:VEVENT"])
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _unfold_ics_lines(text: str) -> list[str]:
+    raw_lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines: list[str] = []
+    for line in raw_lines:
+        if line.startswith((" ", "\t")) and lines:
+            lines[-1] += line[1:]
+        elif line:
+            lines.append(line)
+    return lines
+
+
+def _parse_ics_datetime(value: str) -> tuple[str, str]:
+    value = str(value or "").strip()
+    if not value:
+        return _today_iso(), ""
+    if "T" in value:
+        date_part, time_part = value.split("T", 1)
+        time_part = time_part.replace("Z", "")[:4]
+        try:
+            date_iso = dt.datetime.strptime(date_part[:8], "%Y%m%d").date().isoformat()
+        except ValueError:
+            date_iso = _today_iso()
+        time_iso = f"{time_part[:2]}:{time_part[2:4]}" if len(time_part) >= 4 else ""
+        return date_iso, _hhmm(time_iso)
+    try:
+        return dt.datetime.strptime(value[:8], "%Y%m%d").date().isoformat(), ""
+    except ValueError:
+        return _today_iso(), ""
+
+
+def _parse_ics_events(text: str) -> list[dict]:
+    events: list[dict] = []
+    current: dict[str, str] | None = None
+    for line in _unfold_ics_lines(text):
+        upper = line.upper()
+        if upper == "BEGIN:VEVENT":
+            current = {}
+            continue
+        if upper == "END:VEVENT" and current is not None:
+            start = current.get("DTSTART", "")
+            date_iso, time_iso = _parse_ics_datetime(start)
+            _, end_iso = _parse_ics_datetime(current.get("DTEND", ""))
+            events.append(
+                _normalize_event(
+                    {
+                        "id": current.get("UID") or uuid.uuid4().hex,
+                        "title": _ics_unescape(current.get("SUMMARY", "Imported event")),
+                        "date": date_iso,
+                        "time": time_iso,
+                        "end_time": end_iso,
+                        "location": _ics_unescape(current.get("LOCATION", "")),
+                        "notes": _ics_unescape(current.get("DESCRIPTION", "")),
+                        "source": "ics",
+                    }
+                )
+            )
+            current = None
+            continue
+        if current is None or ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        name = name.split(";", 1)[0].upper()
+        if name in {"UID", "SUMMARY", "DTSTART", "DTEND", "DESCRIPTION", "LOCATION"}:
+            current[name] = value
+    return events
+
+
+def _upsert_calendar_event(event: dict) -> dict:
+    events = _load_calendar_events()
+    incoming = _normalize_event(event)
+    replaced = False
+    for index, existing in enumerate(events):
+        if existing.get("id") == incoming["id"]:
+            events[index] = incoming
+            replaced = True
+            break
+    if not replaced:
+        events.append(incoming)
+    _save_calendar_events(events)
+    return incoming
+
+
+def _delete_calendar_event(event_id: str) -> bool:
+    event_id = str(event_id or "").strip()
+    events = _load_calendar_events()
+    kept = [event for event in events if event.get("id") != event_id]
+    if len(kept) == len(events):
+        return False
+    _save_calendar_events(kept)
+    return True
+
+
+def _import_ics_calendar(text: str) -> int:
+    imported = _parse_ics_events(text)
+    if not imported:
+        return 0
+    existing = {event.get("id"): event for event in _load_calendar_events()}
+    for event in imported:
+        if event["id"] in existing:
+            event["id"] = f"{event['id']}-{uuid.uuid4().hex[:6]}"
+        existing[event["id"]] = event
+    _save_calendar_events(list(existing.values()))
+    return len(imported)
+
+
+def _write_calendar_export() -> str:
+    ics = _events_to_ics(_load_calendar_events())
+    CALENDAR_EXPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CALENDAR_EXPORT_PATH.write_text(ics, encoding="utf-8", newline="")
+    return ics
+
+
+def _ip_candidates() -> list[str]:
+    ips: set[str] = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+    except OSError:
+        pass
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.2)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            ips.add(ip)
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    try:
+        raw = subprocess.check_output(
+            ["ipconfig"],
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=1.5,
+        )
+        for ip in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", raw):
+            if not ip.startswith("127.") and not ip.startswith("169.254."):
+                ips.add(ip)
+    except Exception:
+        pass
+    return sorted(ips)
+
+
+def _manifest() -> dict:
+    return {
+        "name": "COSMIC - Personal AI Command System",
+        "short_name": "COSMIC",
+        "description": "Phone control panel for COSMIC running on your laptop.",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": "#030712",
+        "theme_color": "#071426",
+        "icons": [
+            {
+                "src": "/assets/cosmic_icon.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any maskable",
+            },
+            {
+                "src": "/favicon.ico",
+                "sizes": "48x48 64x64 128x128 256x256",
+                "type": "image/x-icon",
+            },
+        ],
+    }
+
+
+SERVICE_WORKER = r"""// COSMIC_FIX_NEVER_STALE_CACHE
+// The cache name is stamped with a per-server-startup token below.
+// On activate, every older cache is dropped, so a new COSMIC launch
+// can never serve stale JS even if a service worker was previously installed.
+const CACHE_NAME = 'cosmic-shell-__COSMIC_BUILD_TOKEN__';
+// '/' is intentionally NOT in SHELL. The HTML page must always come from the network
+// so fixes like goals/tasks rendering show up immediately on the next refresh.
+const SHELL = ['/manifest.webmanifest', '/assets/cosmic_icon.png', '/favicon.ico'];
+
+self.addEventListener('install', event => {
+  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(SHELL)).catch(() => null));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
+  // Always bypass cache for the HTML page itself and for any API call.
+  // Cached fallback is reserved for static assets only.
+  if (url.pathname === '/' || url.pathname.startsWith('/api/')) {
+    event.respondWith(fetch(event.request));
+    return;
+  }
+  event.respondWith(
+    fetch(event.request).then(response => {
+      if (response && response.status === 200 && response.type === 'basic') {
+        const clone = response.clone();
+        caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone)).catch(() => null);
+      }
+      return response;
+    }).catch(() => caches.match(event.request).then(match => match || Response.error()))
+  );
+});
+"""
+
+
+WEB_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!-- COSMIC_FIX_NEVER_STALE_CACHE: prevent the browser from keeping a stale HTML shell. -->
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>COSMIC Command System</title>
+  <meta name="theme-color" content="#030712">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="COSMIC">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/favicon.ico">
+  <link rel="apple-touch-icon" href="/assets/cosmic_icon.png">
+  <!-- COSMIC_FIX_NEVER_STALE_CACHE: build token, used to bust the SW registration below.
+       Note: the JS global is named __cosmicBuildToken__ (not __COSMIC_BUILD_TOKEN__)
+       so the Python server's .replace() doesn't accidentally rewrite the property accessor. -->
+  <script>window.__cosmicBuildToken__='__COSMIC_BUILD_TOKEN__';</script>
+  <style>
+    :root{color-scheme:dark;--bg:#030712;--panel:rgba(8,21,39,.66);--panel2:rgba(15,23,42,.72);--line:rgba(0,240,255,.28);--cyan:#00f0ff;--cyan2:#67e8f9;--purple:#a855f7;--blue:#2563eb;--green:#34d399;--yellow:#facc15;--red:#fb7185;--text:#e5faff;--muted:#91a8bd;--health:100;--healthColor:var(--green)}
+    *{box-sizing:border-box}body{margin:0;min-height:100dvh;overflow:hidden;font:14px/1.45 "Segoe UI",Inter,system-ui,sans-serif;color:var(--text);background:#030712}
+    body:before{content:"";position:fixed;inset:0;background:radial-gradient(circle at 50% 35%,rgba(0,240,255,.15),transparent 32%),radial-gradient(circle at 72% 25%,rgba(168,85,247,.16),transparent 30%),radial-gradient(circle at 12% 72%,rgba(37,99,235,.15),transparent 30%),linear-gradient(135deg,#020617,#050816 52%,#09051a);z-index:-4}
+    body:after{content:"";position:fixed;inset:0;background-image:linear-gradient(rgba(0,240,255,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(0,240,255,.05) 1px,transparent 1px);background-size:92px 92px;mask-image:radial-gradient(circle at center,#000,transparent 74%);pointer-events:none;z-index:-3}
+    .stars,.particles{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:-2}.star{position:absolute;width:2px;height:2px;border-radius:50%;background:#bffaff;box-shadow:0 0 12px var(--cyan);animation:twinkle 3s ease-in-out infinite}.particle{position:absolute;width:7px;height:7px;border-radius:999px;background:var(--purple);box-shadow:0 0 18px var(--purple);animation:drift 18s linear infinite}.particle:after{content:"";position:absolute;inset:3px -34px 3px 8px;background:linear-gradient(90deg,var(--cyan),transparent);border-radius:999px}
+    .pinLock{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:22px;background:radial-gradient(circle at 50% 40%,rgba(0,240,255,.22),transparent 34%),radial-gradient(circle at 70% 20%,rgba(168,85,247,.18),transparent 28%),rgba(2,6,23,.92);backdrop-filter:blur(10px)}.pinLock.hidden{display:none}.pinBox{width:min(420px,92vw);border:1px solid rgba(103,232,249,.62);border-radius:28px;background:linear-gradient(145deg,rgba(7,20,38,.94),rgba(15,23,42,.82));box-shadow:0 0 28px rgba(0,240,255,.18),inset 0 0 22px rgba(0,240,255,.10);padding:28px;text-align:center}.pinBox h2{margin:0 0 8px;letter-spacing:.28em;color:var(--cyan2);text-shadow:0 0 22px var(--cyan)}.pinBox p{margin:0 0 20px;color:#b7c7d8}.pinBox input{width:100%;height:56px;border-radius:18px;border:1px solid rgba(0,240,255,.45);background:rgba(2,8,23,.86);color:var(--text);font-size:22px;text-align:center;letter-spacing:.35em;outline:none}.pinBox button{width:100%;height:52px;margin-top:14px;border:0;border-radius:18px;cursor:pointer;background:linear-gradient(135deg,var(--cyan),var(--purple));color:#020617;font-weight:900}.pinError{min-height:22px;margin-top:12px;color:var(--red);font-weight:700}
+    .app{height:100dvh;display:grid;grid-template-columns:118px minmax(0,1fr);position:relative;z-index:1}.dock{height:100dvh;padding:18px 10px;display:flex;flex-direction:column;gap:12px;background:rgba(2,6,23,.62);border-right:1px solid rgba(0,240,255,.15)}.brand{font-weight:900;letter-spacing:.34em;color:var(--cyan);text-shadow:0 0 18px var(--cyan);font-size:14px;text-align:center;margin:6px 0 12px}.nav{display:flex;flex-direction:column;gap:9px}.nav button{height:70px;border:1px solid transparent;border-radius:20px;background:transparent;color:#c7d7e8;cursor:pointer;transition:.22s ease}.nav button b{display:block;font-size:19px;margin-bottom:4px}.nav button.active,.nav button:hover{border-color:rgba(0,240,255,.42);background:linear-gradient(135deg,rgba(0,240,255,.18),rgba(168,85,247,.24));color:var(--cyan2);box-shadow:0 0 24px rgba(0,240,255,.18)}.dockTools{margin-top:auto;display:grid;grid-template-columns:1fr 1fr;gap:10px}.dockTools span{height:38px;display:grid;place-items:center;border:1px solid rgba(0,240,255,.18);border-radius:13px;background:rgba(15,23,42,.45);color:var(--cyan2)}
+    main{height:100dvh;display:grid;grid-template-rows:88px minmax(0,1fr) 118px 62px;gap:12px;padding:10px 18px 12px;min-width:0}.top{display:grid;grid-template-columns:1fr 2fr 1fr;align-items:center}.localMark{color:#9fb6ca;font-weight:800}.titleWrap{text-align:center;position:relative}.titleWrap:before{content:"";position:absolute;left:50%;top:2px;width:230px;height:50px;transform:translateX(-50%) rotate(-8deg);border-top:2px solid rgba(0,240,255,.7);border-radius:50%;filter:drop-shadow(0 0 10px var(--cyan))}.title{font-size:clamp(34px,3.9vw,54px);letter-spacing:.42em;font-weight:900;color:#dffcff;text-shadow:0 0 28px rgba(0,240,255,.9);line-height:1}.subtitle{font-size:15px;margin-top:5px}.utils{justify-self:end;display:flex;align-items:center;gap:12px}.clock{text-align:right;font:800 16px ui-monospace,monospace}.status{font-size:11px;color:var(--cyan);text-transform:uppercase}.utilBtn{width:34px;height:34px;display:grid;place-items:center;border:1px solid rgba(0,240,255,.28);border-radius:999px;background:rgba(15,23,42,.4);color:#dffcff}.profile{box-shadow:0 0 18px rgba(0,240,255,.35);background:linear-gradient(135deg,rgba(0,240,255,.22),rgba(168,85,247,.22))}
+    .workspace{min-height:0;display:grid;gap:14px}.workspace.home{grid-template-columns:minmax(0,1fr)}.workspace.system{grid-template-columns:minmax(280px,420px) minmax(0,1fr)}.workspace.tasks{grid-template-columns:minmax(0,1.1fr) minmax(320px,.9fr)}.workspace.calendar{grid-template-columns:minmax(0,1fr);align-items:stretch}.workspace.info{grid-template-columns:minmax(0,1fr)}.card{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:24px;background:linear-gradient(145deg,rgba(8,21,39,.72),rgba(4,9,22,.44)),radial-gradient(circle at top left,rgba(0,240,255,.12),transparent 42%);box-shadow:inset 0 0 22px rgba(0,240,255,.09),0 0 22px rgba(2,132,199,.10);backdrop-filter:blur(10px);padding:18px}.card:hover{border-color:rgba(103,232,249,.55)}h2{margin:0 0 13px;font-size:13px;letter-spacing:.04em}.homeCore{min-height:0;display:grid;grid-template-rows:minmax(280px,1fr) minmax(145px,185px);gap:12px}.coreView{position:relative;display:grid;place-items:center;overflow:hidden}.coreView:before{content:"";position:absolute;width:min(760px,92%);aspect-ratio:1.8;border:1px solid rgba(0,240,255,.2);border-radius:50%;animation:spin 22s linear infinite}.holo{width:min(560px,72%);aspect-ratio:1.75;position:relative;filter:drop-shadow(0 0 16px rgba(0,240,255,.30))}.holo .cloud{position:absolute;inset:0;border-radius:49% 51% 52% 48%;background:radial-gradient(circle at 30% 35%,rgba(0,240,255,.78),transparent 10%),radial-gradient(circle at 62% 58%,rgba(168,85,247,.7),transparent 12%),radial-gradient(circle at center,rgba(0,240,255,.22),transparent 58%);border:1px solid rgba(103,232,249,.45);box-shadow:inset 0 0 42px rgba(0,240,255,.22),0 0 34px rgba(168,85,247,.22);animation:morph 7s ease-in-out infinite}.molecule{position:absolute;inset:30%;display:grid;place-items:center}.node{position:absolute;width:22px;height:22px;border-radius:50%;background:radial-gradient(circle,#fff,var(--cyan) 45%,var(--purple));box-shadow:0 0 18px var(--cyan)}.n1{transform:translate(-60px,-20px)}.n2{transform:translate(-18px,40px)}.n3{transform:translate(42px,-46px)}.n4{transform:translate(66px,28px)}.bond{position:absolute;width:120px;height:2px;background:linear-gradient(90deg,transparent,var(--cyan),transparent);opacity:.7}.b1{transform:rotate(27deg)}.b2{transform:rotate(-38deg)}.b3{transform:rotate(88deg)}.dialogue{min-height:0;display:flex;flex-direction:column;padding:14px 18px}.dialogueHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}.dialogueLog{min-height:0;overflow-y:auto;display:grid;gap:8px;padding-right:4px}.bubble{padding:9px 12px;border-radius:16px;background:rgba(2,8,23,.48);border:1px solid rgba(0,240,255,.12)}.bubble.user{color:var(--cyan2)}.bubble.ai{color:#dbeafe}.wave{height:26px;display:flex;align-items:center;justify-content:center;gap:3px;flex-shrink:0}.wave i{width:3px;border-radius:6px;background:linear-gradient(180deg,var(--purple),var(--cyan));animation:bars 1s ease-in-out infinite}
+    .systemGrid{display:grid;grid-template-rows:auto auto;gap:14px}.statusRing{width:142px;height:142px;margin:4px auto 14px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--healthColor) calc(var(--health)*1%),rgba(30,64,90,.55) 0),radial-gradient(circle,#0b1932 58%,transparent 61%);box-shadow:0 0 26px rgba(0,240,255,.22)}.statusRing div{width:110px;height:110px;border-radius:50%;display:grid;place-items:center;background:#071426}.statusRing b{font-size:32px;font-weight:300}.statusRing span{font-size:11px;color:var(--healthColor);font-weight:800}.metric,.component{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid rgba(148,163,184,.08)}.component strong{color:var(--green)}.metric strong{color:var(--cyan2)}.miniWave{height:74px;margin:8px 0 12px;border:1px solid rgba(0,240,255,.12);border-radius:14px;background:repeating-linear-gradient(90deg,transparent 0 13px,rgba(0,240,255,.08) 14px),linear-gradient(180deg,transparent 46%,rgba(0,240,255,.28) 47% 50%,transparent 51%)}.miniWave svg{width:100%;height:100%}.healthGrid{display:grid;grid-template-columns:repeat(3,minmax(90px,1fr));gap:8px}.healthGrid div{padding:10px;border-radius:13px;background:rgba(2,8,23,.45);border:1px solid rgba(0,240,255,.12);min-width:0}.healthGrid b{display:block;color:var(--cyan2);white-space:nowrap}.goals .project{font-size:18px;margin-bottom:8px}.progress{height:9px;border-radius:999px;background:rgba(148,163,184,.18);overflow:hidden}.progress span{display:block;height:100%;width:62%;background:linear-gradient(90deg,var(--cyan),var(--purple));box-shadow:0 0 16px var(--cyan)}.objectives{margin:14px 0;display:grid;gap:8px}.objective{display:flex;gap:8px;align-items:center;color:#cbd5e1}.objective:before{content:"◎";color:var(--cyan)}.gantt{display:grid;gap:8px;margin:14px 0}.ganttRow{height:18px;border-radius:999px;background:rgba(148,163,184,.1);overflow:hidden}.ganttRow span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--cyan),var(--purple))}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.subgrid div{border:1px solid rgba(0,240,255,.12);border-radius:14px;padding:12px;background:rgba(2,8,23,.34);font-size:12px;color:var(--muted)}.scheduleRows{display:grid;gap:10px}.scheduleRow{display:grid;grid-template-columns:22px minmax(0,1fr) 92px;align-items:center;gap:8px}.check{width:16px;height:16px;border:1px solid var(--cyan);border-radius:4px;box-shadow:0 0 8px rgba(0,240,255,.25)}.pill{font-size:10px;text-align:center;border-radius:999px;padding:4px 7px;background:rgba(0,240,255,.12);border:1px solid rgba(0,240,255,.2);color:var(--cyan2)}
+    .calendarShell{min-height:0;display:grid;grid-template-columns:minmax(620px,1.65fr) minmax(380px,.85fr);gap:18px;overflow:hidden}.calendarToolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}.calendarToolbar strong{font-size:20px;letter-spacing:.04em}.calendarToolbar button,.calendarForm button,.calendarMiniButton{border:1px solid rgba(0,240,255,.28);border-radius:14px;background:rgba(0,240,255,.10);color:var(--cyan2);font-weight:800;cursor:pointer;padding:8px 12px}.calendarToolbar button:hover,.calendarForm button:hover,.calendarMiniButton:hover{border-color:rgba(103,232,249,.68);box-shadow:0 0 14px rgba(0,240,255,.18)}.calendarWeek,.calendarGrid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendarWeek span{color:var(--muted);font-size:11px;text-transform:uppercase;text-align:center}.calendarDay{min-height:86px;border:1px solid rgba(0,240,255,.14);border-radius:16px;background:rgba(2,8,23,.38);padding:8px;cursor:pointer;overflow:hidden}.calendarDay:hover,.calendarDay.selected{border-color:rgba(103,232,249,.72);box-shadow:inset 0 0 20px rgba(0,240,255,.10),0 0 16px rgba(0,240,255,.14)}.calendarDay.other{opacity:.36}.calendarDay.today{background:linear-gradient(145deg,rgba(0,240,255,.14),rgba(168,85,247,.10))}.dayNum{font-weight:900;color:#dffcff}.eventDot{margin-top:5px;padding:2px 6px;border-radius:999px;background:rgba(0,240,255,.12);border:1px solid rgba(0,240,255,.16);font-size:10px;color:var(--cyan2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.calendarForm{display:grid;gap:9px}.calendarForm input,.calendarForm textarea{width:100%;height:38px;border:1px solid rgba(0,240,255,.2);border-radius:12px;background:rgba(2,8,23,.55);padding:0 10px;color:var(--text);outline:none}.calendarForm textarea{height:76px;padding:10px;resize:vertical}.calendarForm .two{display:grid;grid-template-columns:1fr 1fr;gap:8px}.eventList{display:grid;gap:8px;max-height:260px;overflow:auto;padding-right:4px}.eventItem{border:1px solid rgba(0,240,255,.15);border-radius:14px;background:rgba(2,8,23,.35);padding:10px}.eventItem b{display:block;color:var(--cyan2)}.eventMeta{color:var(--muted);font-size:12px;margin:2px 0 8px}.eventActions{display:flex;gap:8px}.eventActions button{font-size:11px;padding:5px 8px;border-radius:999px;border:1px solid rgba(0,240,255,.22);background:rgba(0,240,255,.08);color:var(--cyan2);cursor:pointer}.icsBox{margin-top:10px}.icsBox textarea{width:100%;height:94px;border:1px solid rgba(0,240,255,.18);border-radius:14px;background:rgba(2,8,23,.45);color:var(--text);padding:10px;resize:vertical}
+
+    .actions{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}.action{position:relative;text-align:left;border:1px solid rgba(0,240,255,.35);border-radius:20px;background:linear-gradient(145deg,rgba(8,21,39,.72),rgba(4,9,22,.48));color:var(--text);padding:14px;cursor:pointer;box-shadow:inset 0 0 28px rgba(0,240,255,.1);transition:.2s;min-width:0}.action:hover{transform:translateY(-3px);border-color:var(--cyan2)}.action.purple{border-color:rgba(168,85,247,.75);box-shadow:0 0 28px rgba(168,85,247,.18),inset 0 0 30px rgba(168,85,247,.1)}.badge{position:absolute;right:10px;top:10px;font-size:10px;color:var(--cyan2);border:1px solid rgba(0,240,255,.22);border-radius:999px;padding:2px 7px;background:rgba(0,240,255,.08)}.actionIcon{width:32px;height:32px;border:1px solid rgba(0,240,255,.35);border-radius:12px;display:grid;place-items:center;margin-bottom:8px;color:var(--cyan2);background:rgba(0,240,255,.1)}.action b{display:block;font-size:15px;margin-bottom:2px}.action span:not(.badge):not(.actionIcon){color:#b6c7d8;font-size:12px}.arrow{position:absolute;right:12px;bottom:12px;color:var(--cyan)}
+    form{height:62px;display:flex;gap:10px;align-items:center;border:1px solid rgba(0,240,255,.28);border-radius:30px;padding:7px;background:rgba(8,21,39,.72);box-shadow:0 0 30px rgba(0,240,255,.12);backdrop-filter:blur(10px)}input{flex:1;height:100%;border:0;outline:0;background:transparent;color:var(--text);padding:0 18px;font-size:15px;min-width:0}form button{height:46px;border-radius:24px;border:1px solid rgba(0,240,255,.35);background:rgba(0,240,255,.1);color:var(--cyan2);font-weight:800;cursor:pointer;padding:0 18px}[data-autonomy],[data-performance]{cursor:pointer}[data-autonomy].active,[data-performance].active{background:linear-gradient(135deg,rgba(0,240,255,.35),rgba(168,85,247,.35));box-shadow:0 0 18px rgba(0,240,255,.24)}body[data-performance="performance"] .particles{display:none}body[data-performance="performance"] .star:nth-child(n+30){display:none}body[data-performance="performance"] .holo .cloud{animation-duration:12s}#sendButton{min-width:58px;background:linear-gradient(135deg,rgba(0,240,255,.28),rgba(168,85,247,.22))}
+
+    /* COSMIC_EDITABLE_ACTIVE_GOALS */
+    .goalEditor{margin-top:14px;display:grid;gap:10px}
+    .goalEditor input,.goalEditor textarea{width:100%;border:1px solid rgba(0,240,255,.20);border-radius:13px;background:rgba(2,8,23,.55);color:var(--text);outline:none;padding:10px 12px}
+    .goalEditor input{height:39px}
+    .goalEditor textarea{min-height:74px;resize:vertical}
+    .goalEditor .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .goalObjectiveInputs{display:grid;gap:8px}
+    .goalObjectiveRow{display:grid;grid-template-columns:minmax(0,1fr) 38px;gap:8px}
+    .goalObjectiveRow button,.goalActions button,.miniGoalBtn{border:1px solid rgba(0,240,255,.28);border-radius:13px;background:rgba(0,240,255,.10);color:var(--cyan2);font-weight:800;cursor:pointer;padding:8px 12px}
+    .goalObjectiveRow button{padding:0}
+    .goalActions{display:flex;gap:10px;flex-wrap:wrap}
+    .goalActions .primary{background:linear-gradient(135deg,rgba(0,240,255,.26),rgba(168,85,247,.24));color:#eaffff}
+    .goalHint{font-size:12px;color:var(--muted);margin-top:-4px}
+
+
+    /* COSMIC_EXPANDED_CALENDAR_UI */
+    body[data-tab="Calendar"] main{grid-template-rows:88px minmax(0,1fr) 0 62px}
+    body[data-tab="Calendar"] .actions{display:none}
+    body[data-tab="Calendar"] .workspace.calendar{min-height:0}
+    .calendarShell{height:100%;min-height:0}
+    .calendarCard,.calendarEditor{min-height:0}
+    .calendarCard{display:flex;flex-direction:column}
+    .calendarCard .calendarToolbar{flex:0 0 auto}
+    .calendarCard .calendarWeek{flex:0 0 auto;margin-bottom:6px}
+    .calendarCard .calendarGrid{flex:1;min-height:0;grid-template-rows:repeat(6,minmax(78px,1fr))}
+    .calendarCard .calendarDay{min-height:0;padding:10px;border-radius:18px}
+    .calendarCard .dayNum{font-size:16px}
+    .calendarCard .eventDot{font-size:11px;padding:3px 7px;margin-top:6px}
+    .calendarCard .calendarDay.selected{background:linear-gradient(145deg,rgba(0,240,255,.20),rgba(168,85,247,.16));border-color:rgba(103,232,249,.88);box-shadow:inset 0 0 24px rgba(0,240,255,.14),0 0 22px rgba(0,240,255,.20)}
+    .calendarEditor{display:flex;flex-direction:column;overflow:auto}
+    .calendarEditor .calendarForm textarea{height:118px}
+    .calendarEditor .eventList{max-height:none;min-height:128px;flex:1}
+    .calendarEditor .icsBox{flex:0 0 auto;padding-bottom:2px}
+
+
+    .quickPanel{position:fixed;right:20px;top:86px;z-index:30;width:min(430px,calc(100vw - 30px));max-height:calc(100dvh - 120px);overflow:auto;border:1px solid rgba(103,232,249,.5);border-radius:22px;background:linear-gradient(145deg,rgba(8,21,39,.96),rgba(15,23,42,.88));box-shadow:0 0 34px rgba(0,240,255,.18),inset 0 0 22px rgba(0,240,255,.08);backdrop-filter:blur(14px);padding:16px}.quickPanel.hidden{display:none}.quickTop{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}.quickTop h3{margin:0;color:var(--cyan2);letter-spacing:.08em;font-size:14px}.quickClose{width:30px;height:30px;border-radius:999px;border:1px solid rgba(0,240,255,.25);background:rgba(2,8,23,.42);color:var(--cyan2);cursor:pointer}.quickPanel p{margin:8px 0;color:#b7c7d8}.quickGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.quickPanel label{display:grid;gap:5px;color:#a8bfd2;font-size:12px}.quickPanel input,.quickPanel select{width:100%;height:38px;border:1px solid rgba(0,240,255,.22);border-radius:12px;background:rgba(2,8,23,.58);color:var(--text);padding:0 10px;outline:none}.quickActions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.quickAction{height:38px;border-radius:14px;border:1px solid rgba(0,240,255,.32);background:rgba(0,240,255,.1);color:var(--cyan2);font-weight:800;cursor:pointer;padding:0 12px}.quickAction.primary{background:linear-gradient(135deg,rgba(0,240,255,.28),rgba(168,85,247,.28));color:#eaffff}.quickList{margin-top:10px;max-height:150px;overflow:auto;border:1px solid rgba(0,240,255,.12);border-radius:14px;background:rgba(2,8,23,.42);padding:10px;color:#bfefff;white-space:pre-wrap}.quickNotice{margin-top:10px;border:1px solid rgba(0,240,255,.16);border-radius:14px;background:rgba(0,240,255,.07);padding:10px;color:var(--cyan2)}.quickLog{display:grid;gap:8px;max-height:260px;overflow:auto}.quickLog div{border:1px solid rgba(0,240,255,.12);border-radius:12px;background:rgba(2,8,23,.35);padding:8px;color:#dbeafe}.utilBtn{cursor:pointer;transition:.18s ease}.utilBtn:hover{border-color:rgba(103,232,249,.65);box-shadow:0 0 18px rgba(0,240,255,.20);transform:translateY(-1px)}
+
+    @media (max-width:980px){body{overflow:auto}.app{height:auto;min-height:100dvh;grid-template-columns:1fr}.dock{position:sticky;top:0;z-index:5;height:auto;display:block;padding:10px 12px}.brand{text-align:left;margin:0 0 8px}.nav{display:grid;grid-template-columns:repeat(6,minmax(70px,1fr));overflow-x:auto}.nav button{height:54px;font-size:12px}.nav button b{display:none}.dockTools{display:none}main{height:auto;min-height:100dvh;grid-template-rows:auto auto auto auto;padding:12px}.top{grid-template-columns:1fr}.localMark{display:none}.utils{justify-self:center;margin-top:8px}.title{font-size:34px}.subtitle{font-size:13px}.workspace,.workspace.home,.workspace.system,.workspace.tasks,.workspace.calendar,.workspace.info{grid-template-columns:1fr}.homeCore{grid-template-rows:minmax(260px,45vh) auto}.actions{grid-template-columns:1fr 1fr}.action{min-height:112px}form{position:sticky;bottom:10px;z-index:4}body[data-tab="Calendar"] main{height:auto;grid-template-rows:auto minmax(0,1fr) 62px}.subgrid{grid-template-columns:1fr}}@media (max-width:560px){.nav{grid-template-columns:repeat(3,1fr)}.actions{grid-template-columns:1fr}.scheduleRow{grid-template-columns:22px 1fr}.pill{grid-column:2}.utilBtn{width:32px;height:32px}.utils{gap:8px;flex-wrap:wrap}}
+    @keyframes twinkle{50%{opacity:.25;transform:scale(.65)}}@keyframes drift{to{transform:translate3d(50px,-70px,0)}}@keyframes spin{to{transform:rotate(360deg)}}@keyframes morph{0%,100%{transform:scale(1) rotate(0);border-radius:49% 51% 52% 48%}50%{transform:scale(1.04) rotate(2deg);border-radius:42% 58% 46% 54%}}@keyframes bars{50%{height:24px}}
+  </style>
+</head>
+<body>
+<div id="pinLock" class="pinLock hidden" aria-modal="true" role="dialog"><div class="pinBox"><h2>COSMIC LOCKED</h2><p>Enter your COSMIC phone PIN to unlock the command center.</p><input id="pinInput" inputmode="numeric" autocomplete="one-time-code" maxlength="12" placeholder="PIN"><button id="pinUnlock" type="button">Unlock COSMIC</button><div id="pinError" class="pinError"></div></div></div>
+<div class="stars" id="stars"></div><div class="particles" id="particles"></div>
+<div class="app">
+  <aside class="dock"><div class="brand">COSMIC</div><nav class="nav" id="nav"><button class="active" data-panel="Home"><b>⌂</b>Home</button><button data-panel="Memory"><b>◌</b>Memory</button><button data-panel="Knowledge"><b>□</b>Knowledge</button><button data-panel="Tasks"><b>☑</b>Tasks</button><button data-panel="Calendar"><b>▣</b>Calendar</button><button data-panel="System"><b>⬡</b>System</button></nav><div class="dockTools"><span>✦</span><span>≋</span><span>☆</span><span>⚙</span><span>＋</span><span>－</span></div></aside>
+  <main>
+    <header class="top"><div class="localMark">LOCAL AI</div><div class="titleWrap"><div class="title">COSMIC</div><div class="subtitle">Your Personal AI Command System</div></div><div class="utils"><div><div class="clock" id="clock">--:-- PM</div><div class="status" id="status">CONNECTING</div></div><button class="utilBtn" id="quickInstall" type="button" title="Install or open app">⌁</button><button class="utilBtn" id="quickBell" type="button" title="Notifications">🔔</button><button class="utilBtn" id="quickVoice" type="button" title="Voice settings">🎙</button><button class="utilBtn" id="quickSettings" type="button" title="System settings">⚙</button><button class="utilBtn profile" id="quickProfile" type="button" title="COSMIC status">◉</button></div></header>
+    <section class="workspace home" id="workspace"></section>
+    <section class="actions"><button class="action" data-action="Study Mode"><span class="badge">Predictive</span><span class="actionIcon">□</span><b>Study Mode</b><span>Focus and learn deeply</span><span class="arrow">→</span></button><button class="action" data-action="Brainstorm"><span class="badge">Predictive</span><span class="actionIcon">◌</span><b>Brainstorm</b><span>Generate clean ideas</span><span class="arrow">→</span></button><button class="action purple" data-action="Voice Command"><span class="badge">Predictive</span><span class="actionIcon">🎙</span><b>Voice Command</b><span>Speak or type naturally</span><span class="arrow">→</span></button><button class="action" data-action="Tasks"><span class="badge">Predictive</span><span class="actionIcon">☑</span><b>Tasks</b><span>Track and complete work</span><span class="arrow">→</span></button><button class="action" data-action="System Control"><span class="badge">Predictive</span><span class="actionIcon">⬡</span><b>System Control</b><span>Settings and controls</span><span class="arrow">→</span></button></section>
+    <form id="form"><input id="message" maxlength="4000" autocomplete="off" placeholder="Initiate Physics deep-dive or ask for project details..."><button id="muteToggle" type="button">Mute</button><button id="sendButton" type="submit">➤</button></form>
+  </main>
+</div>
+<div id="quickPanel" class="quickPanel hidden" role="dialog" aria-live="polite"></div>
+<script>
+  const $=s=>document.querySelector(s), workspace=$('#workspace'), statusEl=$('#status'), form=$('#form'), input=$('#message'), button=$('#sendButton'), muteBtn=$('#muteToggle'), quickPanel=$('#quickPanel');
+  let cursor=0,activeTab='Home',webMuted=false,deferredInstall=null,unlocked=false,polling=false,lastMetrics={},lastAutonomy={level:'balanced'},lastBackgroundTasks=[],lastResearchTasks=[],lastPerformance={mode:'performance',web_poll_ms:3000},lastVoice={engine:'windows',gemini_voice:'Charon',windows_voice:'',windows_rate:0,windows_volume:90},uiLogs=['SYS: COSMIC command dialogue ready.'];
+  window.addEventListener('beforeinstallprompt', e=>{e.preventDefault();deferredInstall=e;});
+
+
+  // COSMIC_FIX_RESTORE_WEB_HELPERS
+  function escapeHtml(value){
+    return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  }
+  function stars(){
+    const starLayer=$('#stars'), particleLayer=$('#particles');
+    if(starLayer && !starLayer.children.length){
+      for(let i=0;i<72;i++){
+        const s=document.createElement('i');
+        s.className='star';
+        s.style.left=(Math.random()*100).toFixed(2)+'%';
+        s.style.top=(Math.random()*100).toFixed(2)+'%';
+        s.style.animationDelay=(Math.random()*3).toFixed(2)+'s';
+        starLayer.appendChild(s);
+      }
+    }
+    if(particleLayer && !particleLayer.children.length){
+      for(let i=0;i<18;i++){
+        const p=document.createElement('i');
+        p.className='particle';
+        p.style.left=(Math.random()*100).toFixed(2)+'%';
+        p.style.top=(Math.random()*100).toFixed(2)+'%';
+        p.style.animationDelay=(-(Math.random()*18)).toFixed(2)+'s';
+        particleLayer.appendChild(p);
+      }
+    }
+  }
+  function clock(){
+    const el=$('#clock');
+    if(!el)return;
+    el.textContent=new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  }
+  function makeWave(count=48){
+    return Array.from({length:count},(_,i)=>'<i style="height:'+(6+Math.abs(Math.sin(i*.44))*22).toFixed(0)+'px;animation-delay:'+(i*.035).toFixed(2)+'s"></i>').join('');
+  }
+  function logsHtml(){
+    return uiLogs.slice(-18).map(line => '<div class="bubble ai">'+escapeHtml(line)+'</div>').join('');
+  }
+  function add(line){
+    line=String(line || '').trim();
+    if(!line)return;
+    uiLogs.push(line);
+    if(uiLogs.length>80)uiLogs=uiLogs.slice(-80);
+    const box=$('#dialogueLog');
+    if(box){
+      const div=document.createElement('div');
+      div.className=line.startsWith('Dhaval:')?'bubble user':'bubble ai';
+      div.textContent=line;
+      box.appendChild(div);
+      box.scrollTop=box.scrollHeight;
+    }
+  }
+  function updateMuteButton(){
+    if(muteBtn)muteBtn.textContent=webMuted?'Unmute':'Mute';
+  }
+  function pct(value,fallback=0){
+    const n=Number(value);
+    return Number.isFinite(n)?Math.max(0,Math.min(100,n)):fallback;
+  }
+  function healthColor(label,health){
+    if(String(label||'').toLowerCase().includes('high') || health<60)return 'var(--red)';
+    if(String(label||'').toLowerCase().includes('busy') || health<82)return 'var(--yellow)';
+    return 'var(--green)';
+  }
+  function miniWave(){
+    const a=Array.from({length:42},(_,i)=>`${i*6},${36+(Math.sin(i*.7)*12)+(Math.cos(i*.23)*7)}`).join(' ');
+    const b=Array.from({length:42},(_,i)=>`${i*6},${38+(Math.cos(i*.55)*10)}`).join(' ');
+    return '<div class="miniWave"><svg viewBox="0 0 246 74" preserveAspectRatio="none"><polyline points="'+a+'" fill="none" stroke="#67e8f9" stroke-width="2"/><polyline points="'+b+'" fill="none" stroke="#a855f7" stroke-width="2" opacity=".85"/></svg></div>';
+  }
+  function systemCards(){
+    const m=lastMetrics||{};
+    const health=pct(m.health ?? 100,100);
+    const label=m.health_label || (health>82?'Optimal':health>60?'Busy':'High load');
+    const color=healthColor(label,health);
+    document.documentElement.style.setProperty('--health', health);
+    document.documentElement.style.setProperty('--healthColor', color);
+    return '<div class="systemGrid"><div class="card"><h2>SYSTEM STATUS</h2><div class="statusRing"><div><b id="healthValue">'+Math.round(health)+'%</b><span id="healthLabel">'+escapeHtml(label).toUpperCase()+'</span></div></div><div class="component"><span>Core Systems</span><strong>Online</strong></div><div class="component"><span>Memory Bank</span><strong>Stable</strong></div><div class="component"><span>Knowledge Graph</span><strong>Active</strong></div><div class="component"><span>Learning Engine</span><strong>Active</strong></div></div><div class="card"><h2>UPTIME / SYSTEM HEALTH</h2>'+miniWave()+'<div class="healthGrid"><div><span>CPU</span><b id="metricCpu">'+Math.round(pct(m.cpu))+'%</b></div><div><span>Memory</span><b id="metricMemory">'+Math.round(pct(m.memory))+'%</b></div><div><span>Network</span><b id="metricNet">'+Number(m.network_mbps||0).toFixed(2)+' MB/s</b></div></div><div class="metric"><span>Processes</span><strong id="metricProcesses">'+escapeHtml(m.processes ?? '-').toString()+'</strong></div><div class="metric"><span>Uptime</span><strong id="metricUptime">'+formatUptime(m.uptime_seconds)+'</strong></div></div></div>'+autonomyCard();
+  }
+  function formatUptime(seconds){
+    seconds=Math.max(0,Number(seconds)||0);
+    const h=Math.floor(seconds/3600), m=Math.floor((seconds%3600)/60), s=Math.floor(seconds%60);
+    return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+  }
+  function updateMetrics(metrics){
+    lastMetrics=Object.assign({},lastMetrics||{},metrics||{});
+    const m=lastMetrics, health=pct(m.health ?? 100,100), label=m.health_label || (health>82?'Optimal':health>60?'Busy':'High load'), color=healthColor(label,health);
+    document.documentElement.style.setProperty('--health', health);
+    document.documentElement.style.setProperty('--healthColor', color);
+    const set=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value};
+    set('healthValue',Math.round(health)+'%');set('healthLabel',String(label).toUpperCase());
+    set('metricCpu',Math.round(pct(m.cpu))+'%');set('metricMemory',Math.round(pct(m.memory))+'%');
+    set('metricNet',Number(m.network_mbps||0).toFixed(2)+' MB/s');set('metricProcesses',m.processes ?? '-');
+    set('metricUptime',formatUptime(m.uptime_seconds));
+  }
+  function autonomyCard(){
+    const level=(lastAutonomy&&lastAutonomy.level)||'balanced';
+    return '<div class="card"><h2>AUTONOMY / RESEARCH</h2><div class="project">Thinking mode <span id="autonomyMode" style="float:right;color:var(--cyan2)">'+escapeHtml(level).toUpperCase()+'</span></div><div class="subgrid" style="grid-template-columns:repeat(3,1fr);margin-top:12px"><button type="button" data-autonomy="low" class="pill">Low</button><button type="button" data-autonomy="balanced" class="pill">Balanced</button><button type="button" data-autonomy="high" class="pill">High</button></div><div class="objectives" id="backgroundTaskList" style="margin-top:14px"><div class="objective">Background task layer ready</div><div class="objective">Research notes can be promoted into memory</div></div></div>';
+  }
+  function updateAutonomyView(){
+    const level=(lastAutonomy&&lastAutonomy.level)||'balanced';
+    const mode=$('#autonomyMode');if(mode)mode.textContent=level.toUpperCase();
+    document.querySelectorAll('[data-autonomy]').forEach(b=>b.classList.toggle('active',b.dataset.autonomy===level));
+    const list=$('#backgroundTaskList');
+    if(list){
+      const items=[...(lastBackgroundTasks||[]),...(lastResearchTasks||[])].slice(-4);
+      list.innerHTML=(items.length?items.map(x=>'<div class="objective">'+escapeHtml(x.title||x.query||x.status||JSON.stringify(x))+'</div>').join(''):'<div class="objective">No active background tasks</div>');
+    }
+  }
+  function bindAutonomyButtons(){
+    document.querySelectorAll('[data-autonomy]').forEach(btn=>btn.onclick=async()=>{
+      const level=btn.dataset.autonomy;
+      try{
+        const r=await fetch('/api/autonomy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({level})});
+        if(!r.ok)throw new Error((await r.json()).error||'Autonomy update failed');
+        lastAutonomy={level};updateAutonomyView();add('SYS: Autonomy set to '+level+'.');
+      }catch(e){add('SYS: '+(e.message||e))}
+    });
+  }
+  function updatePerformanceView(){
+    const mode=(lastPerformance&&lastPerformance.mode)||'performance';
+    document.body.dataset.performance=mode;
+    document.querySelectorAll('[data-performance]').forEach(b=>b.classList.toggle('active',b.dataset.performance===mode));
+    const el=$('#performanceMode');if(el)el.textContent=mode.toUpperCase();
+  }
+  function bindPerformanceButtons(){
+    document.querySelectorAll('[data-performance]').forEach(btn=>btn.onclick=async()=>{
+      const mode=btn.dataset.performance;
+      try{
+        const r=await fetch('/api/performance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});
+        const out=await r.json();if(!r.ok)throw new Error(out.error||'Performance update failed');
+        lastPerformance=Object.assign({},lastPerformance,{mode:out.mode||mode});updatePerformanceView();add('SYS: Performance mode set to '+mode+'.');
+      }catch(e){add('SYS: '+(e.message||e))}
+    });
+  }
+  function scheduleHtml(editable=false){
+    return '<div class="scheduleRows">'+tasks.map((t,i)=>'<div class="scheduleRow"><span class="check"></span><strong>'+escapeHtml(t.task||'Task')+'</strong><span class="pill">'+escapeHtml(t.tag||t.time||'Ready')+'</span>'+(editable?'<button type="button" data-remove="'+i+'" class="pill" title="Remove task">Delete</button>':'')+'</div>').join('')+'</div>';
+  }
+  async function fetchVoice(){
+    try{
+      const r=await fetch('/api/voice',{cache:'no-store'}),out=await r.json();
+      if(r.ok)lastVoice=Object.assign({},lastVoice,out.voice||{});
+      return out;
+    }catch(e){return {voice:lastVoice,voices:[]}}
+  }
+  function showQuick(title,html){
+    if(!quickPanel)return;
+    quickPanel.classList.remove('hidden');
+    quickPanel.innerHTML='<div class="quickTop"><h3>'+escapeHtml(title)+'</h3><button class="quickClose" type="button">×</button></div>'+html;
+    const close=quickPanel.querySelector('.quickClose');
+    if(close)close.onclick=()=>quickPanel.classList.add('hidden');
+  }
+  function bindUtilityButtons(){
+    const install=$('#quickInstall'), bell=$('#quickBell'), voice=$('#quickVoice'), settings=$('#quickSettings'), profile=$('#quickProfile');
+    if(install)install.onclick=async()=>{if(deferredInstall){deferredInstall.prompt();deferredInstall=null}else showQuick('APP LAUNCHER','<p>COSMIC can be opened from your desktop launcher. Browser install prompt is not available right now.</p>')};
+    if(bell)bell.onclick=()=>showQuick('NOTIFICATIONS','<div class="quickLog">'+uiLogs.slice(-12).map(x=>'<div>'+escapeHtml(x)+'</div>').join('')+'</div>');
+    if(settings)settings.onclick=()=>showQuick('SYSTEM SETTINGS','<p>Quick performance controls.</p><div class="quickActions"><button class="quickAction" data-performance="performance">Performance</button><button class="quickAction" data-performance="balanced">Balanced</button><button class="quickAction" data-performance="cinematic">Cinematic</button></div>');
+    if(profile)profile.onclick=()=>showQuick('COSMIC STATUS','<p>Status: '+escapeHtml(statusEl.textContent||'CONNECTING')+'</p><p>CPU '+Math.round(pct(lastMetrics.cpu))+'% • Memory '+Math.round(pct(lastMetrics.memory))+'%</p><p>Voice: '+escapeHtml((lastVoice&&lastVoice.engine)||'windows')+'</p>');
+    if(voice)voice.onclick=async()=>{
+      const data=await fetchVoice();
+      const v=Object.assign({},lastVoice,data.voice||{});
+      const voices=(data.voices||[]).map(name=>'<option value="'+escapeHtml(name)+'" '+(name===v.windows_voice?'selected':'')+'>'+escapeHtml(name)+'</option>').join('');
+      showQuick('VOICE SETTINGS','<div class="quickGrid"><label>Engine<select id="voiceEngine"><option value="windows" '+(v.engine==='windows'?'selected':'')+'>Windows voice</option><option value="gemini" '+(v.engine==='gemini'?'selected':'')+'>Gemini voice</option></select></label><label>Windows Voice<select id="windowsVoice"><option value="">Default Windows voice</option>'+voices+'</select></label><label>Rate<input id="voiceRate" type="number" min="-10" max="10" value="'+escapeHtml(v.windows_rate??0)+'"></label><label>Volume<input id="voiceVolume" type="number" min="0" max="100" value="'+escapeHtml(v.windows_volume??90)+'"></label></div><div class="quickActions"><button class="quickAction primary" id="saveVoice">Save voice</button><button class="quickAction" id="testVoice">Test voice</button></div><div class="quickNotice">Mark5 is set up to prefer Windows voices.</div>');
+      const save=async(test=false)=>{
+        const payload={action:test?'test':'update',voice:{engine:$('#voiceEngine').value,windows_voice:$('#windowsVoice').value,windows_rate:Number($('#voiceRate').value||0),windows_volume:Number($('#voiceVolume').value||90)},text:'COSMIC voice test ready.'};
+        const r=await fetch('/api/voice',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+        const out=await r.json();if(!r.ok)throw new Error(out.error||'Voice update failed');
+        lastVoice=out.voice||payload.voice;add(test?'SYS: Voice test requested.':'SYS: Voice settings saved.');
+      };
+      $('#saveVoice').onclick=()=>save(false).catch(e=>add('SYS: '+(e.message||e)));
+      $('#testVoice').onclick=()=>save(true).catch(e=>add('SYS: '+(e.message||e)));
+    };
+  }
+  function isoDate(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
+  function todayISO(){return isoDate(new Date())}
+  function monthName(d){return d.toLocaleDateString([], {month:'long', year:'numeric'})}
+  function eventsFor(date){return calendarEvents.filter(e=>e.date===date).sort((a,b)=>String(a.time||'').localeCompare(String(b.time||'')))}
+  function calendarLayout(){
+    if(!selectedDate)selectedDate=todayISO();
+    return '<div class="calendarShell"><div class="card calendarCard"><div class="calendarToolbar"><strong id="calendarTitle">'+monthName(calendarCursor)+'</strong><div><button type="button" id="prevMonth">‹</button><button type="button" id="todayMonth">Today</button><button type="button" id="nextMonth">›</button></div></div><div class="calendarWeek"><span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span></div><div class="calendarGrid" id="calendarGrid"></div></div><div class="card calendarEditor"><h2>EDIT EVENT</h2><div class="calendarForm"><input id="eventTitle" placeholder="Event title"><div class="two"><input id="eventDate" type="date" value="'+selectedDate+'"><input id="eventTime" type="time"></div><div class="two"><input id="eventEnd" type="time"><input id="eventLocation" placeholder="Location"></div><textarea id="eventNotes" placeholder="Notes"></textarea><div class="two"><button id="saveEvent" type="button">Add Event</button><button id="clearEvent" type="button">Clear</button></div></div><h2 style="margin-top:16px">SELECTED DAY</h2><div id="selectedDayTitle" style="color:var(--muted);margin-bottom:8px"></div><div id="selectedEvents" class="eventList"></div><div class="icsBox"><h2>GOOGLE / WINDOWS .ICS</h2><div class="quickActions"><button type="button" class="calendarMiniButton" id="exportIcs">Export .ics</button><button type="button" class="calendarMiniButton" id="importIcs">Import Paste</button></div><textarea id="icsPaste" placeholder="Paste .ics text here, then click Import Paste"></textarea></div></div></div>';
+  }
+  async function loadCalendar(){
+    try{
+      const r=await fetch('/api/calendar',{cache:'no-store'}),out=await r.json();
+      if(!r.ok)throw new Error(out.error||'Calendar load failed');
+      calendarEvents=Array.isArray(out.events)?out.events:[];
+    }catch(e){add('SYS: '+(e.message||e));calendarEvents=calendarEvents||[]}
+  }
+  function renderCalendarLoaded(){
+    const title=$('#calendarTitle'), grid=$('#calendarGrid'), list=$('#selectedEvents'), selectedTitle=$('#selectedDayTitle');
+    if(title)title.textContent=monthName(calendarCursor);
+    if(!grid)return;
+    const y=calendarCursor.getFullYear(), m=calendarCursor.getMonth();
+    const first=new Date(y,m,1), start=new Date(y,m,1-first.getDay());
+    const today=todayISO();
+    grid.innerHTML='';
+    for(let i=0;i<42;i++){
+      const d=new Date(start);d.setDate(start.getDate()+i);
+      const iso=isoDate(d), dayEvents=eventsFor(iso);
+      const btn=document.createElement('button');
+      btn.type='button';btn.className='calendarDay'+(d.getMonth()!==m?' other':'')+(iso===today?' today':'')+(iso===selectedDate?' selected':'');
+      btn.dataset.date=iso;
+      btn.innerHTML='<div class="dayNum">'+d.getDate()+'</div>'+dayEvents.slice(0,3).map(e=>'<div class="eventDot">'+escapeHtml((e.time?e.time+' ':'')+(e.title||'Event'))+'</div>').join('');
+      btn.onclick=()=>{selectedDate=iso;editingEventId='';fillEventForm({date:iso});renderCalendarLoaded()};
+      grid.appendChild(btn);
+    }
+    if(selectedTitle)selectedTitle.textContent=selectedDate;
+    if(list){
+      const items=eventsFor(selectedDate);
+      list.innerHTML=items.length?items.map(e=>'<div class="eventItem"><b>'+escapeHtml(e.title||'Untitled event')+'</b><div class="eventMeta">'+escapeHtml([e.date,e.time,e.end_time?'- '+e.end_time:'',e.location].filter(Boolean).join(' '))+'</div><div>'+escapeHtml(e.notes||'')+'</div><div class="eventActions"><button type="button" data-edit-event="'+escapeHtml(e.id)+'">Edit</button><button type="button" data-delete-event="'+escapeHtml(e.id)+'">Delete</button></div></div>').join(''):'<div class="eventItem"><b>No events yet</b><div class="eventMeta">Add one above.</div></div>';
+      list.querySelectorAll('[data-edit-event]').forEach(btn=>btn.onclick=()=>{const ev=calendarEvents.find(x=>x.id===btn.dataset.editEvent);if(ev){editingEventId=ev.id;fillEventForm(ev)}});
+      list.querySelectorAll('[data-delete-event]').forEach(btn=>btn.onclick=()=>deleteCalendarEvent(btn.dataset.deleteEvent));
+    }
+  }
+  function fillEventForm(ev={}){
+    $('#eventTitle').value=ev.title||'';
+    $('#eventDate').value=ev.date||selectedDate||todayISO();
+    $('#eventTime').value=ev.time||'';
+    $('#eventEnd').value=ev.end_time||'';
+    $('#eventLocation').value=ev.location||'';
+    $('#eventNotes').value=ev.notes||'';
+  }
+  function bindCalendarControls(){
+    const prev=$('#prevMonth'), next=$('#nextMonth'), today=$('#todayMonth'), save=$('#saveEvent'), clear=$('#clearEvent'), exportBtn=$('#exportIcs'), importBtn=$('#importIcs');
+    if(prev)prev.onclick=()=>{calendarCursor.setMonth(calendarCursor.getMonth()-1);renderCalendarLoaded()};
+    if(next)next.onclick=()=>{calendarCursor.setMonth(calendarCursor.getMonth()+1);renderCalendarLoaded()};
+    if(today)today.onclick=()=>{calendarCursor=new Date();selectedDate=todayISO();renderCalendarLoaded()};
+    if(clear)clear.onclick=()=>{editingEventId='';fillEventForm({date:selectedDate||todayISO()})};
+    if(save)save.onclick=saveCalendarEvent;
+    if(exportBtn)exportBtn.onclick=exportCalendarIcs;
+    if(importBtn)importBtn.onclick=importCalendarIcs;
+  }
+  async function saveCalendarEvent(){
+    const event={id:editingEventId||undefined,title:$('#eventTitle').value.trim()||'Untitled event',date:$('#eventDate').value||selectedDate||todayISO(),time:$('#eventTime').value,end_time:$('#eventEnd').value,location:$('#eventLocation').value.trim(),notes:$('#eventNotes').value.trim(),source:'cosmic'};
+    selectedDate=event.date;
+    try{
+      const r=await fetch('/api/calendar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'upsert',event})});
+      const out=await r.json();if(!r.ok)throw new Error(out.error||'Event save failed');
+      calendarEvents=Array.isArray(out.events)?out.events:calendarEvents;editingEventId='';fillEventForm({date:selectedDate});renderCalendarLoaded();add('SYS: Calendar event saved.');
+    }catch(e){add('SYS: '+(e.message||e))}
+  }
+  async function deleteCalendarEvent(id){
+    if(!id || !confirm('Delete this calendar event?'))return;
+    try{
+      const r=await fetch('/api/calendar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete',id})});
+      const out=await r.json();if(!r.ok)throw new Error(out.error||'Delete failed');
+      calendarEvents=Array.isArray(out.events)?out.events:calendarEvents.filter(e=>e.id!==id);editingEventId='';renderCalendarLoaded();add('SYS: Calendar event deleted.');
+    }catch(e){add('SYS: '+(e.message||e))}
+  }
+  async function exportCalendarIcs(){
+    try{
+      const r=await fetch('/api/calendar.ics',{cache:'no-store'});if(!r.ok)throw new Error('Export failed');
+      const blob=await r.blob(), url=URL.createObjectURL(blob), a=document.createElement('a');
+      a.href=url;a.download='cosmic-calendar.ics';a.click();setTimeout(()=>URL.revokeObjectURL(url),1500);add('SYS: Calendar .ics exported.');
+    }catch(e){add('SYS: '+(e.message||e))}
+  }
+  async function importCalendarIcs(){
+    const text=($('#icsPaste')&&$('#icsPaste').value||'').trim();
+    if(!text){add('SYS: Paste .ics text first.');return}
+    try{
+      const r=await fetch('/api/calendar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'import_ics',ics:text})});
+      const out=await r.json();if(!r.ok)throw new Error(out.error||'Import failed');
+      calendarEvents=Array.isArray(out.events)?out.events:calendarEvents;renderCalendarLoaded();add('SYS: Imported '+(out.imported||0)+' calendar events.');
+    }catch(e){add('SYS: '+(e.message||e))}
+  }
+
+  const baseFetch=window.fetch.bind(window);
+  window.fetch=async(resource,options={})=>{const url=String(resource);options=options||{};if(url.startsWith('/api/')){options.headers=Object.assign({},options.headers||{});const pin=localStorage.getItem('cosmicPhonePin');if(pin)options.headers['X-COSMIC-PIN']=pin}const response=await baseFetch(resource,options);if(response.status===401){localStorage.removeItem('cosmicPhonePin');unlocked=false;showPinLock('PIN required to access COSMIC.')}return response};
+  const pinLock=$('#pinLock'), pinInput=$('#pinInput'), pinUnlock=$('#pinUnlock'), pinError=$('#pinError');
+  function setPinError(message){if(pinError)pinError.textContent=message||''}function showPinLock(message){if(!pinLock)return;setPinError(message||'');pinLock.classList.remove('hidden');setTimeout(()=>pinInput&&pinInput.focus(),80)}function hidePinLock(){if(pinLock)pinLock.classList.add('hidden');setPinError('')}async function verifyPin(pin){const r=await baseFetch('/api/auth',{method:'POST',headers:{'Content-Type':'application/json','X-COSMIC-PIN':pin},body:'{}'});return r.ok}
+  async function unlockWithPin(){const pin=(pinInput&&pinInput.value||'').trim();if(!pin){setPinError('Enter the PIN first.');return}if(pinUnlock){pinUnlock.disabled=true;pinUnlock.textContent='Checking...'}try{if(await verifyPin(pin)){localStorage.setItem('cosmicPhonePin',pin);unlocked=true;hidePinLock();add('SYS: Phone PIN accepted. COSMIC unlocked.');startPolling()}else{localStorage.removeItem('cosmicPhonePin');showPinLock('Wrong PIN. Try again.');if(pinInput)pinInput.value=''}}catch(e){showPinLock('Could not reach COSMIC. Make sure the laptop app is running.')}finally{if(pinUnlock){pinUnlock.disabled=false;pinUnlock.textContent='Unlock COSMIC'}}}
+  async function initSecurity(){try{const r=await baseFetch('/api/security',{cache:'no-store'}),s=await r.json();if(!s.pin_required){unlocked=true;hidePinLock();return true}const stored=localStorage.getItem('cosmicPhonePin');if(stored&&await verifyPin(stored)){unlocked=true;hidePinLock();return true}localStorage.removeItem('cosmicPhonePin');showPinLock('Enter your COSMIC phone PIN.');return false}catch(e){showPinLock('Security check failed. Restart COSMIC, then refresh.');return false}}
+  document.addEventListener('click',e=>{if(e.target&&e.target.id==='pinUnlock')unlockWithPin()});document.addEventListener('keydown',e=>{if(e.key==='Enter'&&document.activeElement&&document.activeElement.id==='pinInput')unlockWithPin()});
+  const defaultTasks=[{task:'Physics Schedule',time:'10:00 AM',tag:'In progress'},{task:'Project Work',time:'01:30 PM',tag:'Linked'},{task:'Gym',time:'06:00 PM',tag:'Small'},{task:'Code Practice',time:'08:30 PM',tag:'Resources'}];let tasks=JSON.parse(localStorage.getItem('cosmicTasks')||'null')||defaultTasks;function saveTasks(){localStorage.setItem('cosmicTasks',JSON.stringify(tasks))}
+
+  let calendarEvents=[],calendarCursor=new Date(),selectedDate='',editingEventId='';
+
+  const defaultGoals={title:'Physics Lab Report 2',completed:0,total:10,objectives:['Physics Lab Reporting','Draft findings and graphs','Gantt refinement'],recents:'Physics Lab Report 2 notes and study sessions.',notes:'Recent notes can be promoted into Mark 5 memory.'};
+  let activeGoals=Object.assign({},defaultGoals);
+  function cleanGoals(g){g=g||{};const total=Math.max(1,Math.min(999,Number(g.total||defaultGoals.total)||defaultGoals.total)),completed=Math.max(0,Math.min(total,Number(g.completed||0)||0));let objectives=Array.isArray(g.objectives)?g.objectives.map(x=>String(x||'').trim()).filter(Boolean).slice(0,12):defaultGoals.objectives.slice();if(!objectives.length)objectives=defaultGoals.objectives.slice();return {title:String(g.title||defaultGoals.title).trim()||defaultGoals.title,completed,total,objectives,recents:String(g.recents||defaultGoals.recents).trim(),notes:String(g.notes||defaultGoals.notes).trim()}}
+  async function loadGoals(){try{const r=await fetch('/api/goals',{cache:'no-store'}),out=await r.json();if(!r.ok)throw new Error(out.error||'Goals load failed');activeGoals=cleanGoals(out.goals);return true}catch(e){add('SYS: '+e.message);activeGoals=cleanGoals(activeGoals);return false}}
+  function goalObjectiveInput(value=''){return '<div class="goalObjectiveRow"><input class="goalObjectiveInput" value="'+escapeHtml(value)+'" placeholder="Goal objective"><button type="button" data-goal-remove title="Remove objective">×</button></div>'}
+  function collectGoals(){const title=$('#goalTitle').value.trim()||defaultGoals.title,total=Math.max(1,Math.min(999,Number($('#goalTotal').value||10)||10)),completed=Math.max(0,Math.min(total,Number($('#goalCompleted').value||0)||0));const objectives=Array.from(document.querySelectorAll('.goalObjectiveInput')).map(x=>x.value.trim()).filter(Boolean).slice(0,12);return cleanGoals({title,completed,total,objectives,recents:$('#goalRecents').value.trim(),notes:$('#goalNotes').value.trim()})}
+  async function saveGoals(action='save'){try{const payload=action==='reset'?{action:'reset'}:{action:'save',goals:collectGoals()};const r=await fetch('/api/goals',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),out=await r.json();if(!r.ok)throw new Error(out.error||'Goal save failed');activeGoals=cleanGoals(out.goals);add(action==='reset'?'SYS: Active goals reset.':'SYS: Active goals saved.');renderTasks()}catch(e){add('SYS: '+e.message)}}
+  function bindGoalControls(){
+    const wrap=$('#goalObjectiveInputs');
+    function bindRemove(){document.querySelectorAll('[data-goal-remove]').forEach(btn=>btn.onclick=()=>{if(document.querySelectorAll('.goalObjectiveInput').length<=1){btn.parentElement.querySelector('input').value='';return}btn.parentElement.remove()})}
+    bindRemove();
+    const addBtn=$('#addGoalObjective');if(addBtn)addBtn.onclick=()=>{wrap.insertAdjacentHTML('beforeend',goalObjectiveInput(''));bindRemove();const inputs=wrap.querySelectorAll('.goalObjectiveInput');inputs[inputs.length-1].focus()};
+    const saveBtn=$('#saveGoals');if(saveBtn)saveBtn.onclick=()=>saveGoals('save');
+    const resetBtn=$('#resetGoals');if(resetBtn)resetBtn.onclick=()=>{if(confirm('Reset Active Context and Goals to the default Mark 5 project?'))saveGoals('reset')};
+  }
+
+  // COSMIC_FIX_TASKS_STUCK_LOADING
+  function goalsHtml(){
+    const g=cleanGoals(activeGoals),pct=Math.max(0,Math.min(100,Math.round((g.completed/g.total)*100))),mid=Math.max(18,Math.min(82,pct));
+    return '<div class="card goals"><h2>ACTIVE CONTEXT AND GOALS</h2><div class="project">'+escapeHtml(g.title)+' <span style="float:right;color:var(--muted)">'+g.completed+' / '+g.total+'</span></div><div class="progress"><span style="width:'+pct+'%"></span></div><div class="objectives">'+g.objectives.map(x=>'<div class="objective">'+escapeHtml(x)+'</div>').join('')+'</div><div class="gantt"><div class="ganttRow"><span style="width:'+Math.max(18,mid)+'%"></span></div><div class="ganttRow"><span style="width:36%;margin-left:'+Math.max(8,Math.min(58,pct))+'%;background:linear-gradient(90deg,#60a5fa,#a855f7)"></span></div><div class="ganttRow"><span style="width:22%;margin-left:'+Math.max(22,Math.min(72,pct+18))+'%;background:linear-gradient(90deg,#a855f7,#f472b6)"></span></div></div><div class="subgrid"><div><b>Recents</b><br>'+escapeHtml(g.recents||'No recent context yet.')+'</div><div><b>Notes</b><br>'+escapeHtml(g.notes||'No notes yet.')+'</div></div><div class="goalEditor"><h2>EDIT ACTIVE GOALS</h2><input id="goalTitle" value="'+escapeHtml(g.title)+'" placeholder="Project / context title"><div class="two"><input id="goalCompleted" type="number" min="0" value="'+g.completed+'" placeholder="Completed"><input id="goalTotal" type="number" min="1" value="'+g.total+'" placeholder="Total"></div><div id="goalObjectiveInputs" class="goalObjectiveInputs">'+g.objectives.map(goalObjectiveInput).join('')+'</div><button class="miniGoalBtn" id="addGoalObjective" type="button">+ Add objective</button><textarea id="goalRecents" placeholder="Recent context">'+escapeHtml(g.recents)+'</textarea><textarea id="goalNotes" placeholder="Notes">'+escapeHtml(g.notes)+'</textarea><div class="goalHint">Saved goals are shared by local web and phone access.</div><div class="goalActions"><button class="primary" id="saveGoals" type="button">Save Goals</button><button id="resetGoals" type="button">Reset</button></div></div></div>'
+  }
+
+  function renderHome(){workspace.className='workspace home';workspace.innerHTML='<div class="homeCore"><div class="coreView card"><div class="holo"><div class="cloud"></div><div class="molecule"><div class="bond b1"></div><div class="bond b2"></div><div class="bond b3"></div><i class="node n1"></i><i class="node n2"></i><i class="node n3"></i><i class="node n4"></i></div></div></div><div class="dialogue card"><div class="dialogueHead"><h2>LIVE DIALOGUE</h2><span style="color:var(--muted)">Runtime conversation</span></div><div class="dialogueLog" id="dialogueLog"><div class="bubble user">Dhaval: “Review my recent study patterns.”</div><div class="bubble ai">COSMIC: I’m keeping Home focused on the AI runtime. System and Tasks now live in their own tabs.</div>'+logsHtml()+'</div><div class="wave">'+makeWave()+'</div></div></div>';const box=$('#dialogueLog');if(box)box.scrollTop=box.scrollHeight}
+  function performanceCard(){const p=lastPerformance||{},mode=(p.mode||'performance').toLowerCase();return '<div class="card"><h2>EXPERIENCE / PERFORMANCE</h2><div class="project">Mode <span id="performanceMode" style="float:right;color:var(--cyan2)">'+mode.toUpperCase()+'</span></div><p id="performanceNote" style="color:var(--muted)">Performance mode: lighter animation and slower polling.</p><div class="subgrid" style="grid-template-columns:repeat(3,1fr)"><button type="button" data-performance="performance" class="pill">Performance</button><button type="button" data-performance="balanced" class="pill">Balanced</button><button type="button" data-performance="cinematic" class="pill">Cinematic</button></div><div class="objectives" style="margin-top:14px"><div class="objective">Windows voice mode active</div><div class="objective">Phone/web cache updated</div><div class="objective">Launcher self-check ready</div></div></div>'}
+  function renderSystem(){workspace.className='workspace system';workspace.innerHTML=systemCards()+performanceCard();updateMetrics(lastMetrics);updateAutonomyView();bindAutonomyButtons();updatePerformanceView();bindPerformanceButtons()}
+
+
+
+  // COSMIC_FIX_TABS_NONBLOCKING
+  function drawTasks(){
+    activeGoals=cleanGoals(activeGoals);
+    workspace.className='workspace tasks';
+    workspace.innerHTML=goalsHtml()+'<div class="card"><h2>TODAY\'S SCHEDULE</h2>'+scheduleHtml(true)+'<div class="subgrid" style="margin-top:12px"><div><input id="taskName" placeholder="Task name" style="width:100%;height:36px;border:1px solid rgba(0,240,255,.2);border-radius:12px;background:rgba(2,8,23,.5);padding:0 10px;color:var(--text)"></div><div><input id="taskTime" placeholder="Time/status" style="width:100%;height:36px;border:1px solid rgba(0,240,255,.2);border-radius:12px;background:rgba(2,8,23,.5);padding:0 10px;color:var(--text)"></div></div><button id="addTask" type="button" style="margin-top:10px;border:1px solid rgba(0,240,255,.35);border-radius:14px;background:rgba(0,240,255,.12);color:var(--cyan2);padding:8px 12px">Add Task</button></div>';
+    bindGoalControls();
+    workspace.querySelectorAll('[data-remove]').forEach(el=>el.onclick=()=>{tasks.splice(Number(el.dataset.remove),1);saveTasks();drawTasks()});
+    const addTask=$('#addTask');
+    if(addTask)addTask.onclick=()=>{const n=$('#taskName').value.trim(),tm=$('#taskTime').value.trim()||'Anytime';if(!n)return;tasks.push({task:n,time:tm,tag:tm});saveTasks();add('SYS: Added task - '+n);drawTasks()};
+  }
+  function renderTasks(){
+    drawTasks();
+    const timer=setTimeout(()=>{if(activeTab==='Tasks')add('SYS: Goals sync is slow; showing local editable goals.')},2500);
+    loadGoals().then(()=>{clearTimeout(timer);if(activeTab==='Tasks')drawTasks()}).catch(e=>{clearTimeout(timer);add('SYS: Goals sync failed; showing local editable goals.')});
+  }
+
+  async function renderCalendar(){workspace.className='workspace calendar';workspace.innerHTML=calendarLayout();bindCalendarControls();await loadCalendar();renderCalendarLoaded()}
+  function renderInfo(tab){workspace.className='workspace info';const data={Memory:['Memory routing is ready for Mark 5.','Remembered facts, routines, and preferences will live here.'],Knowledge:['Study mode, research summaries, and explanations.','Drop files in desktop COSMIC for document analysis.']};workspace.innerHTML='<div class="card"><h2>'+tab.toUpperCase()+'</h2><div class="objectives">'+(data[tab]||[]).map(x=>'<div class="objective">'+x+'</div>').join('')+'</div></div>'}
+
+  function setActiveTab(tab){
+    try{
+      activeTab=tab;
+      document.body.dataset.tab=tab;
+      document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b.dataset.panel===tab));
+      if(tab==='Home')renderHome();
+      else if(tab==='System')renderSystem();
+      else if(tab==='Tasks')renderTasks();
+      else if(tab==='Calendar')renderCalendar();
+      else renderInfo(tab);
+    }catch(e){
+      workspace.className='workspace info';
+      workspace.innerHTML='<div class="card"><h2>'+escapeHtml(tab||'COSMIC')+' VIEW ERROR</h2><p style="color:var(--red)">This tab hit a UI error: '+escapeHtml(e.message||e)+'</p><p style="color:var(--muted)">The rest of COSMIC is still alive. Refresh after applying the latest fix.</p></div>';
+      try{add('SYS: '+tab+' tab error - '+(e.message||e))}catch(_){}
+    }
+  }
+
+  async function apiJson(url,options={},timeoutMs=12000){
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),timeoutMs);
+    try{
+      const r=await fetch(url,Object.assign({},options,{cache:'no-store',signal:controller.signal}));
+      const out=await r.json().catch(()=>({}));
+      if(!r.ok)throw new Error(out.error||('HTTP '+r.status));
+      return out;
+    }finally{clearTimeout(timer)}
+  }
+  async function poll(){
+    if(!unlocked){polling=false;return}
+    let delay=(lastPerformance&&lastPerformance.web_poll_ms)||3000;
+    try{
+      const state=await apiJson('/api/status',{},15000);
+      webMuted=!!state.muted;updateMuteButton();
+      statusEl.textContent=state.connected?(webMuted?'MUTED':(state.state||'ONLINE')):'STARTING';
+      lastVoice=state.voice||lastVoice;
+      lastAutonomy=state.autonomy||lastAutonomy;
+      lastBackgroundTasks=state.background_tasks||[];
+      lastResearchTasks=state.research_tasks||[];
+      lastPerformance=state.performance||lastPerformance;
+      updateMetrics(state.metrics||{});
+      updateAutonomyView();
+      updatePerformanceView();
+      delay=(lastPerformance&&lastPerformance.web_poll_ms)||delay;
+    }catch(e){
+      statusEl.textContent='STALE';
+      add('SYS: Status refresh slow - '+(e.message||e));
+      delay=Math.max(delay,5000);
+    }
+    try{
+      const logs=await apiJson('/api/logs?after='+cursor,{},15000);
+      (logs.items||[]).forEach(add);
+      cursor=Number(logs.next||cursor);
+    }catch(e){
+      add('SYS: Log refresh slow - '+(e.message||e));
+    }
+    setTimeout(poll,delay);
+  }
+  function startPolling(){if(polling)return;polling=true;poll()}
+  document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>setActiveTab(b.dataset.panel));function focusCommand(){form.scrollIntoView({block:'end',behavior:'smooth'});setTimeout(()=>input.focus(),120)}
+  document.querySelectorAll('.action').forEach(b=>b.onclick=()=>{const a=b.dataset.action;if(a==='Tasks')setActiveTab('Tasks');else if(a==='System Control')setActiveTab('System');else if(a==='Study Mode'){setActiveTab('Knowledge');input.value='Start Physics deep-dive for ';focusCommand()}else if(a==='Brainstorm'){setActiveTab('Home');input.value='Brainstorm project ideas for ';focusCommand()}else{focusCommand();add('SYS: Voice command mode ready.')}})
+  muteBtn.addEventListener('click',async()=>{const next=!webMuted;muteBtn.disabled=true;try{const r=await fetch('/api/mute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({muted:next})});const out=await r.json();if(!r.ok)throw new Error(out.error||'Mute failed');webMuted=!!out.muted;updateMuteButton();add('SYS: Microphone '+(webMuted?'muted':'active')+' from web.')}catch(e){add('SYS: '+e.message)}finally{muteBtn.disabled=false}});
+  form.addEventListener('submit',async e=>{e.preventDefault();const text=input.value.trim();if(!text)return;button.disabled=true;try{const r=await fetch('/api/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});const out=await r.json();if(!r.ok)add('SYS: '+(out.error||'Message failed'));else input.value=''}catch(e){add('SYS: COSMIC is unreachable.')}finally{button.disabled=false;input.focus()}});
+  
+  try{
+    if('serviceWorker' in navigator){
+      navigator.serviceWorker.getRegistrations().then(regs=>Promise.all(regs.map(r=>r.unregister()))).catch(()=>null);
+      if(location.search.includes('clearCosmicCache=1') && window.caches){
+        caches.keys().then(keys=>Promise.all(keys.map(k=>caches.delete(k)))).catch(()=>null);
+      }
+    }
+  }catch(e){console.warn('COSMIC cache cleanup failed',e)}
+  try{stars()}catch(e){console.warn('COSMIC stars disabled',e)}
+  try{clock();setInterval(clock,1000)}catch(e){console.warn('COSMIC clock failed',e)}
+  try{bindUtilityButtons()}catch(e){console.warn('COSMIC utility buttons failed',e)}
+  setActiveTab('Home');
+  initSecurity().then(ok=>{if(ok){fetchVoice().catch(()=>null);startPolling()}}).catch(()=>showPinLock('Security check failed. Restart COSMIC, then refresh.'));
+
+</script>
+</body>
+</html>"""
+
+
+class CosmicWebServer:
+    def __init__(
+        self,
+        submit_message: Callable[[str], bool],
+        get_status: Callable[[], dict],
+        get_logs: Callable[[int], dict],
+        set_muted: Callable[[bool], bool] | None = None,
+        set_autonomy: Callable[[str], bool] | None = None,
+        set_performance: Callable[[str], bool] | None = None,
+        host: str = WEB_HOST,
+        port: int = WEB_PORT,
+    ):
+        self.submit_message = submit_message
+        self.get_status = get_status
+        self.get_logs = get_logs
+        self.set_muted = set_muted
+        self.set_autonomy = set_autonomy
+        self.set_performance = set_performance
+        self.host = host
+        self.port = port
+        self._server: ThreadingHTTPServer | None = None
+
+
+    def _authorized(self, handler) -> bool:
+        config = _load_phone_security()
+        if not config.get("enabled", False):
+            return True
+        return _verify_phone_pin(handler.headers.get("X-COSMIC-PIN", ""), config)
+
+    def security_status(self, client_address: str = "") -> dict:
+        config = _load_phone_security()
+        pin_enabled = bool(config.get("enabled", False))
+        return {
+            "pin_enabled": pin_enabled,
+            "pin_required": pin_enabled,
+            "strict_web_pin": pin_enabled,
+        }
+
+    def access_urls(self) -> dict:
+        local = [f"http://localhost:{self.port}"]
+        network: list[str] = []
+        tailscale: list[str] = []
+        if self.host not in {"127.0.0.1", "::1", "localhost"}:
+            for ip in _ip_candidates():
+                url = f"http://{ip}:{self.port}"
+                if ip.startswith("100."):
+                    tailscale.append(url)
+                else:
+                    network.append(url)
+        return {
+            "local": local,
+            "network": network,
+            "tailscale": tailscale,
+            "host": self.host,
+            "port": self.port,
+        }
+
+    def start(self) -> str:
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send_bytes(
+                self,
+                body: bytes,
+                content_type: str,
+                cache_control: str = "no-store",
+                csp: str | None = None,
+            ):
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", cache_control)
+                self.send_header("X-Content-Type-Options", "nosniff")
+                if csp:
+                    self.send_header("Content-Security-Policy", csp)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _try_static(self, request_path: str) -> bool:
+                if not DIST_DIR.exists():
+                    return False
+
+                try:
+                    dist_root = DIST_DIR.resolve()
+                    relative = request_path.lstrip("/") or "index.html"
+                    static_path = (dist_root / relative).resolve()
+                    static_path.relative_to(dist_root)
+
+                    if static_path.is_dir():
+                        static_path = static_path / "index.html"
+                    if not static_path.is_file():
+                        return False
+
+                    content_type = (
+                        mimetypes.guess_type(static_path.name)[0]
+                        or "application/octet-stream"
+                    )
+                    cache_control = "public, max-age=31536000, immutable"
+                    if static_path.name == "index.html":
+                        content_type = "text/html; charset=utf-8"
+                        cache_control = "no-store"
+
+                    self._send_bytes(
+                        static_path.read_bytes(),
+                        content_type,
+                        cache_control,
+                        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:",
+                    )
+                    return True
+                except (OSError, ValueError):
+                    return False
+
+            def _json(self, payload: dict, status: int = 200):
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                if parsed.path == "/":
+                    if USE_DIST_WEB and self._try_static("index.html"):
+                        return
+                    self._send_bytes(
+                        WEB_PAGE.replace("__COSMIC_BUILD_TOKEN__", BUILD_TOKEN).encode("utf-8"),
+                        "text/html; charset=utf-8",
+                        "no-store",
+                        "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+                    )
+                    return
+                if parsed.path == "/manifest.webmanifest":
+                    self._send_bytes(
+                        json.dumps(_manifest(), ensure_ascii=False).encode("utf-8"),
+                        "application/manifest+json; charset=utf-8",
+                        "no-store",
+                    )
+                    return
+                if parsed.path == "/sw.js":
+                    self._send_bytes(
+                        SERVICE_WORKER.replace("__COSMIC_BUILD_TOKEN__", BUILD_TOKEN).encode("utf-8"),
+                        "application/javascript; charset=utf-8",
+                        "no-store",
+                        "default-src 'self'; script-src 'self'",
+                    )
+                    return
+                if parsed.path == "/favicon.ico":
+                    icon_path = PROJECT_ROOT / "assets" / "cosmic.ico"
+                    if icon_path.is_file():
+                        self._send_bytes(icon_path.read_bytes(), "image/x-icon", "public, max-age=86400")
+                        return
+                if parsed.path == "/assets/cosmic_icon.png":
+                    icon_path = PROJECT_ROOT / "assets" / "cosmic_icon.png"
+                    if icon_path.is_file():
+                        self._send_bytes(icon_path.read_bytes(), "image/png", "public, max-age=86400")
+                        return
+                if parsed.path == "/api/security":
+                    self._json(owner.security_status(self.client_address[0] if self.client_address else ""))
+                    return
+                if parsed.path in {"/api/research_tasks", "/api/status", "/api/access", "/api/logs", "/api/calendar", "/api/calendar.ics", "/api/voice", "/api/goals"}:
+                    if not owner._authorized(self):
+                        self._json({"error": "PIN required for remote phone access", "requires_pin": True}, 401)
+                        return
+                if parsed.path == "/api/calendar":
+                    self._json(_calendar_snapshot())
+                    return
+                if parsed.path == "/api/goals":
+                    self._json(_active_goals_snapshot())
+                    return
+                if parsed.path == "/api/voice":
+                    self._json({"voice": _load_voice_config_web(), "voices": []})
+                    return
+                if parsed.path == "/api/calendar.ics":
+                    ics = _write_calendar_export()
+                    self._send_bytes(
+                        ics.encode("utf-8"),
+                        "text/calendar; charset=utf-8",
+                        "no-store",
+                    )
+                    return
+                if parsed.path == "/api/research_tasks":
+                    self._json(_research_task_snapshot())
+                    return
+                if parsed.path == "/api/status":
+                    self._json(owner.get_status())
+                    return
+                if parsed.path == "/api/access":
+                    self._json(owner.access_urls())
+                    return
+                if parsed.path == "/api/logs":
+                    try:
+                        after = max(0, int(parse_qs(parsed.query).get("after", [0])[0]))
+                    except (TypeError, ValueError):
+                        after = 0
+                    self._json(owner.get_logs(after))
+                    return
+                if USE_DIST_WEB and parsed.path.startswith("/assets/") and self._try_static(parsed.path):
+                    return
+                self._json({"error": "Not found"}, 404)
+
+            def do_POST(self):
+                path = urlparse(self.path).path
+                if path not in {"/api/message", "/api/mute", "/api/auth", "/api/autonomy", "/api/performance", "/api/calendar", "/api/voice", "/api/goals"}:
+                    self._json({"error": "Not found"}, 404)
+                    return
+                origin = self.headers.get("Origin")
+                if origin and urlparse(origin).netloc != self.headers.get("Host"):
+                    self._json({"error": "Cross-origin requests are not allowed"}, 403)
+                    return
+                if not owner._authorized(self):
+                    self._json({"error": "PIN required for remote phone access", "requires_pin": True}, 401)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > 262144:
+                        raise ValueError("Invalid request size")
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    if path == "/api/auth":
+                        self._json({"accepted": True}, 202)
+                        return
+                    if path == "/api/goals":
+                        action = str(payload.get("action") or "save").strip().lower()
+                        if action in {"save", "update", "set"}:
+                            goals = _save_active_goals(payload.get("goals") if isinstance(payload.get("goals"), dict) else payload)
+                            self._json({"accepted": True, "goals": goals}, 202)
+                            return
+                        if action == "reset":
+                            goals = _save_active_goals(_default_active_goals())
+                            self._json({"accepted": True, "goals": goals}, 202)
+                            return
+                        self._json({"error": "Unknown goals action"}, 400)
+                        return
+                    if path == "/api/calendar":
+                        action = str(payload.get("action") or "upsert").strip().lower()
+                        if action == "upsert":
+                            event = _upsert_calendar_event(payload.get("event", {}))
+                            snapshot = _calendar_snapshot()
+                            snapshot.update({"accepted": True, "event": event})
+                            self._json(snapshot, 202)
+                            return
+                        if action == "delete":
+                            deleted = _delete_calendar_event(str(payload.get("id", "")))
+                            snapshot = _calendar_snapshot()
+                            snapshot.update({"accepted": deleted, "deleted": deleted})
+                            self._json(snapshot, 202 if deleted else 404)
+                            return
+                        if action == "import_ics":
+                            imported = _import_ics_calendar(str(payload.get("ics", "")))
+                            snapshot = _calendar_snapshot()
+                            snapshot.update({"accepted": True, "imported": imported})
+                            self._json(snapshot, 202)
+                            return
+                        self._json({"error": "Unknown calendar action"}, 400)
+                        return
+                    if path == "/api/voice":
+                        action = str(payload.get("action") or "update").strip().lower()
+                        if action in {"update", "set"}:
+                            voice = _save_voice_config_web(payload.get("voice") if isinstance(payload.get("voice"), dict) else payload)
+                            self._json({"accepted": True, "voice": voice}, 202)
+                            return
+                        if action in {"test", "speak"}:
+                            voice_payload = payload.get("voice") if isinstance(payload.get("voice"), dict) else payload
+                            voice = _save_voice_config_web(voice_payload)
+                            message = _test_voice_web(str(payload.get("text") or ""))
+                            self._json({"accepted": not message.startswith("Voice test failed"), "voice": voice, "message": message}, 202)
+                            return
+                        if action in {"list", "voices"}:
+                            self._json({"accepted": True, "voice": _load_voice_config_web(), "voices": _list_windows_voices_web()}, 202)
+                            return
+                        self._json({"error": "Unknown voice action"}, 400)
+                        return
+                    if path == "/api/performance":
+                        if owner.set_performance is None:
+                            self._json({"error": "Performance control is not available"}, 503)
+                            return
+                        mode = str(payload.get("mode", "")).strip().lower()
+                        if mode not in {"cinematic", "balanced", "performance"}:
+                            self._json({"error": "Performance mode must be cinematic, balanced, or performance"}, 400)
+                            return
+                        if not owner.set_performance(mode):
+                            self._json({"error": "Performance control failed"}, 503)
+                            return
+                        self._json({"accepted": True, "mode": mode}, 202)
+                        return
+                    if path == "/api/autonomy":
+                        if owner.set_autonomy is None:
+                            self._json({"error": "Autonomy control is not available"}, 503)
+                            return
+                        level = str(payload.get("level", "")).strip().lower()
+                        if level not in {"low", "balanced", "high"}:
+                            self._json({"error": "Autonomy level must be low, balanced, or high"}, 400)
+                            return
+                        if not owner.set_autonomy(level):
+                            self._json({"error": "Autonomy control failed"}, 503)
+                            return
+                        self._json({"accepted": True, "level": level}, 202)
+                        return
+                    if path == "/api/mute":
+                        if owner.set_muted is None:
+                            self._json({"error": "Mute control is not available"}, 503)
+                            return
+                        muted = bool(payload.get("muted"))
+                        if not owner.set_muted(muted):
+                            self._json({"error": "Mute control failed"}, 503)
+                            return
+                        self._json({"accepted": True, "muted": muted}, 202)
+                        return
+                    text = str(payload.get("text", "")).strip()
+                    if not text:
+                        raise ValueError("Message is empty")
+                    if len(text) > 4000:
+                        raise ValueError("Message is too long")
+                    if not owner.submit_message(text):
+                        self._json({"error": "COSMIC is still connecting"}, 503)
+                        return
+                    self._json({"accepted": True}, 202)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._json({"error": str(exc)}, 400)
+
+            def log_message(self, *_):
+                return
+
+        self._server = ThreadingHTTPServer((self.host, self.port), Handler)
+        self.port = self._server.server_address[1]
+        threading.Thread(
+            target=self._server.serve_forever,
+            daemon=True,
+            name="CosmicWebServer",
+        ).start()
+        display_host = "localhost" if self.host in {"127.0.0.1", "::1", "0.0.0.0", ""} else self.host
+        return f"http://{display_host}:{self.port}"
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+

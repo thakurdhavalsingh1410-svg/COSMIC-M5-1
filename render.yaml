@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: cosmic-mark5-cloud
+    runtime: python
+    buildCommand: pip install -r requirements-cloud.txt
+    startCommand: python cloud_app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: COSMIC_WEB_PIN
+        sync: false
+      - key: COSMIC_CLOUD_MODE
+        value: "1"
+      - key: COSMIC_TEXT_MODEL
+        value: gemini-2.5-flash

@@ -1,0 +1,8 @@
+.env
+config/api_keys.json
+config/phone_access.json
+__pycache__/
+*.pyc
+.cosmic_backups/
+logs/
+research_reports/
