@@ -17,12 +17,38 @@ os.environ.setdefault("COSMIC_CLOUD_MODE", "1")
 os.environ.setdefault("COSMIC_PROJECT_ROOT", str(PROJECT_ROOT))
 os.environ.setdefault("COSMIC_WEB_HOST", "0.0.0.0")
 os.environ.setdefault("COSMIC_WEB_PORT", os.getenv("PORT", "8775"))
-if not os.getenv("COSMIC_STATE_DIR"):
+
+
+def _safe_state_dir() -> str:
+    requested = (os.getenv("COSMIC_STATE_DIR") or "").strip()
+    candidates: list[Path] = []
+    if requested:
+        candidates.append(Path(requested))
     disk = Path("/var/data")
-    os.environ["COSMIC_STATE_DIR"] = str(disk / "cosmic") if disk.exists() and os.access(disk, os.W_OK) else "/tmp/cosmic-mark5"
+    if disk.exists():
+        candidates.append(disk / "cosmic")
+    candidates.append(Path("/tmp/cosmic-mark5"))
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write-test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return str(candidate)
+        except Exception:
+            continue
+    return "/tmp/cosmic-mark5"
+
+
+os.environ["COSMIC_STATE_DIR"] = _safe_state_dir()
 
 from core.state_paths import config_file, read_json, atomic_write_json, runtime_state_summary  # noqa: E402
-from web_server import CosmicWebServer  # noqa: E402
+import web_server as _web_server  # noqa: E402
+
+# Cloud mode has no laptop/Gemini Live session. If text is online, the UI should say TEXT ONLINE.
+_web_server.WEB_PAGE = _web_server.WEB_PAGE.replace("LIVE RECONNECTING", "TEXT ONLINE")
+CosmicWebServer = _web_server.CosmicWebServer
 
 
 def _now() -> str:
@@ -79,9 +105,6 @@ def _write_runtime_api_key() -> None:
         "google_api_key": key,
     }
     atomic_write_json(config_file("api_keys.json"), payload, indent=2)
-    project_config = PROJECT_ROOT / "config"
-    project_config.mkdir(exist_ok=True)
-    (project_config / "api_keys.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _write_cloud_pin() -> None:
@@ -149,6 +172,7 @@ class CloudCosmic:
         self._autonomy = {"level": os.getenv("COSMIC_AUTONOMY", "balanced")}
         self._performance = {"mode": "cloud", "web_poll_ms": 3000}
         self.write_log("SYS: COSMIC Mark5 Cloud Mode starting.")
+        self.write_log(f"SYS: Runtime state path: {os.environ.get('COSMIC_STATE_DIR')}")
         self.write_log("SYS: Laptop-control actions are disabled in cloud mode.")
         if not _api_key():
             self.write_log("ERR: GEMINI_API_KEY is not set in Render.")
@@ -309,9 +333,9 @@ class CloudCosmic:
 
         memory_context = ""
         try:
-            from memory.memory_manager import format_memory_for_prompt
+            from memory.memory_manager import format_memory_for_prompt, load_memory
 
-            memory_context = format_memory_for_prompt()
+            memory_context = format_memory_for_prompt(load_memory())
         except Exception:
             memory_context = ""
 
