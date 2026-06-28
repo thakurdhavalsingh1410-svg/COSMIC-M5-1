@@ -1,7 +1,11 @@
-#web_search.py
+# web_search.py
+from __future__ import annotations
+
 import json
+import os
 import sys
 from pathlib import Path
+
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -9,21 +13,57 @@ def _get_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-BASE_DIR        = _get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+BASE_DIR = _get_base_dir()
+
+
+def _read_key_file(path: Path) -> str:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("gemini_api_key", "GEMINI_API_KEY", "api_key", "google_api_key"):
+        value = str(data.get(key, "")).strip()
+        if value:
+            return value
+    return ""
 
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    """Read Gemini key from cloud env first, then COSMIC's runtime config."""
+    for name in (
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENAI_API_KEY",
+        "COSMIC_GEMINI_API_KEY",
+    ):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+
+    try:
+        from core.state_paths import config_file
+
+        value = _read_key_file(config_file("api_keys.json"))
+        if value:
+            return value
+    except Exception:
+        pass
+
+    value = _read_key_file(BASE_DIR / "config" / "api_keys.json")
+    if value:
+        return value
+
+    raise RuntimeError("GEMINI_API_KEY is not configured.")
 
 
 def _gemini_search(query: str) -> str:
     from google import genai
 
-    client   = genai.Client(api_key=_get_api_key())
+    client = genai.Client(api_key=_get_api_key())
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=os.getenv("COSMIC_TEXT_MODEL", "gemini-2.5-flash"),
         contents=query,
         config={"tools": [{"google_search": {}}]},
     )
@@ -48,11 +88,13 @@ def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
     results = []
     with DDGS() as ddgs:
         for r in ddgs.text(query, max_results=max_results):
-            results.append({
-                "title":   r.get("title",  ""),
-                "snippet": r.get("body",   ""),
-                "url":     r.get("href",   ""),
-            })
+            results.append(
+                {
+                    "title": r.get("title", ""),
+                    "snippet": r.get("body", ""),
+                    "url": r.get("href", ""),
+                }
+            )
     return results
 
 
@@ -62,11 +104,15 @@ def _format_ddg(query: str, results: list[dict]) -> str:
 
     lines = [f"Search results for: {query}\n"]
     for i, r in enumerate(results, 1):
-        if r.get("title"):   lines.append(f"{i}. {r['title']}")
-        if r.get("snippet"): lines.append(f"   {r['snippet']}")
-        if r.get("url"):     lines.append(f"   {r['url']}")
+        if r.get("title"):
+            lines.append(f"{i}. {r['title']}")
+        if r.get("snippet"):
+            lines.append(f"   {r['snippet']}")
+        if r.get("url"):
+            lines.append(f"   {r['url']}")
         lines.append("")
     return "\n".join(lines).strip()
+
 
 def _compare(items: list[str], aspect: str) -> str:
     query = (
@@ -76,9 +122,8 @@ def _compare(items: list[str], aspect: str) -> str:
     try:
         return _gemini_search(query)
     except Exception as e:
-        print(f"[WebSearch] ⚠️ Gemini compare failed: {e} — falling back to DDG")
+        print(f"[WebSearch] Gemini compare failed: {e} — falling back to DDG")
 
-    # DDG fallback: fetch results per item and merge
     all_results: dict[str, list] = {}
     for item in items:
         try:
@@ -94,16 +139,17 @@ def _compare(items: list[str], aspect: str) -> str:
                 lines.append(f"  • {r['snippet']}")
     return "\n".join(lines)
 
+
 def web_search(
-    parameters:     dict,
+    parameters: dict,
     response=None,
     player=None,
     session_memory=None,
 ) -> str:
     params = parameters or {}
-    query  = params.get("query", "").strip()
-    mode   = params.get("mode",  "search").lower().strip()
-    items  = params.get("items", [])
+    query = params.get("query", "").strip()
+    mode = params.get("mode", "search").lower().strip()
+    items = params.get("items", [])
     aspect = params.get("aspect", "general").strip() or "general"
 
     if not query and not items:
@@ -115,27 +161,27 @@ def web_search(
     if player:
         player.write_log(f"[Search] {query or ', '.join(items)}")
 
-    print(f"[WebSearch] 🔍 Query: {query!r}  Mode: {mode}")
+    print(f"[WebSearch] Query: {query!r}  Mode: {mode}")
 
     try:
         if mode == "compare" and items:
-            print(f"[WebSearch] 📊 Comparing: {items}")
+            print(f"[WebSearch] Comparing: {items}")
             result = _compare(items, aspect)
-            print("[WebSearch] ✅ Compare done.")
+            print("[WebSearch] Compare done.")
             return result
 
-        print("[WebSearch] 🌐 Trying Gemini...")
+        print("[WebSearch] Trying Gemini...")
         try:
             result = _gemini_search(query)
-            print("[WebSearch] ✅ Gemini OK.")
+            print("[WebSearch] Gemini OK.")
             return result
         except Exception as e:
-            print(f"[WebSearch] ⚠️ Gemini failed ({e}) — trying DDG...")
+            print(f"[WebSearch] Gemini failed ({e}) — trying DDG...")
             results = _ddg_search(query)
-            result  = _format_ddg(query, results)
-            print(f"[WebSearch] ✅ DDG: {len(results)} result(s).")
+            result = _format_ddg(query, results)
+            print(f"[WebSearch] DDG: {len(results)} result(s).")
             return result
 
     except Exception as e:
-        print(f"[WebSearch] ❌ All backends failed: {e}")
+        print(f"[WebSearch] All backends failed: {e}")
         return f"Search failed, sir: {e}"
