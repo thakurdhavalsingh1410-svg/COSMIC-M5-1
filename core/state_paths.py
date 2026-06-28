@@ -21,15 +21,53 @@ def project_root() -> Path:
 PROJECT_ROOT = project_root()
 
 
+def _is_writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".cosmic-write-test-{uuid.uuid4().hex}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
 def state_root() -> Path:
+    """Return a writable runtime storage folder.
+
+    COSMIC can live inside OneDrive/GitHub, but mutable state should not.
+    On Render, /var/data only works if a persistent disk is mounted, so this
+    helper falls back cleanly instead of crashing during import.
+    """
+    candidates: list[Path] = []
+
     override = os.getenv("COSMIC_STATE_DIR", "").strip()
     if override:
-        root = Path(override).expanduser()
+        candidates.append(Path(override).expanduser())
+
+    local = os.getenv("LOCALAPPDATA", "").strip()
+    if local:
+        candidates.append(Path(local) / "COSMIC" / "Mark5")
+
+    if os.name == "nt":
+        candidates.append(Path.home() / "AppData" / "Local" / "COSMIC" / "Mark5")
     else:
-        local = os.getenv("LOCALAPPDATA")
-        root = (Path(local) if local else Path.home() / "AppData" / "Local") / "COSMIC" / "Mark5"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+        candidates.append(Path("/var/data/cosmic"))
+        candidates.append(Path("/tmp/cosmic-mark5"))
+        candidates.append(Path.home() / ".cosmic" / "Mark5")
+
+    seen: set[str] = set()
+    for root in candidates:
+        marker = str(root)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if _is_writable_dir(root):
+            return root
+
+    fallback = Path.cwd() / ".cosmic_state"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 
 STATE_ROOT = state_root()
@@ -52,15 +90,21 @@ _MEMORY_FILES = ["long_term.json", "research_knowledge.json"]
 def _copy_file_if_missing(src: Path, dst: Path) -> None:
     if dst.exists() or not src.exists() or not src.is_file():
         return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    except Exception:
+        return
 
 
 def _copy_dir_if_missing(src: Path, dst: Path) -> None:
     if dst.exists() or not src.exists() or not src.is_dir():
         return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src, dst)
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dst)
+    except Exception:
+        return
 
 
 def ensure_state_ready(project: Path | None = None) -> Path:
@@ -70,6 +114,7 @@ def ensure_state_ready(project: Path | None = None) -> Path:
         (root / folder).mkdir(parents=True, exist_ok=True)
     if _MIGRATED:
         return root
+
     project = Path(project or PROJECT_ROOT)
     for name in _CONFIG_FILES:
         _copy_file_if_missing(project / "config" / name, root / "config" / name)
